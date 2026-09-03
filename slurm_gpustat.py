@@ -34,7 +34,15 @@ from django.utils.functional import lazy
 
 # SLURM states which indicate that the node is not available for submitting jobs
 INACCESSIBLE = {"drain*", "down*", "drng", "drain", "down"}
+INACCESSIBLE_KEYWORDS = ("down", "drain", "drng", "resv", "inval", "plnd", "pow_up", "reboot")
 INTERACTIVE_CMDS = {"bash", "zsh", "sh"}
+
+
+def is_inaccessible(state: str) -> bool:
+    state_lower = state.lower().rstrip("*~$#%")
+    if state_lower in INACCESSIBLE:
+        return True
+    return any(kw in state_lower for kw in INACCESSIBLE_KEYWORDS)
 
 
 class Daemon:
@@ -367,6 +375,8 @@ def node_states(partition: Optional[str] = None) -> dict:
     cmd = "sinfo --noheader"
     if partition:
         cmd += f" --partition={partition}"
+    else:
+        cmd += " -a"
     rows = parse_cmd(cmd)
     states = {}
     for row in rows:
@@ -387,7 +397,7 @@ def get_gpu_partitions(keywords=['gpu', 'ddp']) -> list:
     Returns:
         a list of requested SLURM partitions.
     """
-    cmd = "sinfo --noheader"
+    cmd = "sinfo -a --noheader"
     rows = parse_cmd(cmd)
     partitions = set()
     for row in rows:
@@ -482,7 +492,10 @@ def avail_stats_for_node(node: str) -> dict:
         a mapping between node names and availability stats.
     """
     cmd = f"scontrol show node {node}"
-    rows = [x.strip() for x in parse_cmd(cmd)]
+    try:
+        rows = [x.strip() for x in parse_cmd(cmd)]
+    except subprocess.CalledProcessError:
+        return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
     keys = ("AllocTRES", "CfgTRES")
     metrics = {}
     for row in rows:
@@ -498,6 +511,8 @@ def avail_stats_for_node(node: str) -> dict:
                 else:
                     metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1] 
                                    for token in tokens if "=" in token}
+    if "CfgTRES" not in metrics or "AllocTRES" not in metrics:
+        return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
     occupancy = {}
     for metric, cfg_val in metrics["CfgTRES"].items():
         try:
@@ -534,9 +549,11 @@ def parse_all_gpus(partition: Optional[str] = None,
     Returns:
         a mapping between node names and a list of the GPUs that they have available.
     """
-    cmd = "sinfo -o '%1000N|%1000G' --noheader"
+    cmd = "sinfo -o '%5000N|%5000G' --noheader"
     if partition:
         cmd += f" --partition={partition}"
+    else:
+        cmd += " -a"
     rows = parse_cmd(cmd)
     resources = defaultdict(list)
 
@@ -610,7 +627,7 @@ def summary(mode: str, resources: dict = None, states: dict = None):
         states = node_states()
     if mode == "accessible":
         res = {key: val for key, val in resources.items()
-               if states.get(key, "down") not in INACCESSIBLE}
+               if not is_inaccessible(states.get(key, "down"))}
     elif mode == "up":
         res = resources
     else:
@@ -618,8 +635,13 @@ def summary(mode: str, resources: dict = None, states: dict = None):
     summary_by_type(res, tag=mode)
 
 
+@functools.lru_cache(maxsize=1)
+def _get_slurm_version():
+    return parse_cmd("sinfo -V", split=False).split(" ")[1]
+
+
 @beartype
-def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,interactive-rtx3090,interactive-rtx2080,gpu-h200,gpu-mig") -> dict:
+def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,gpu-b200,gpu-rtxpro6000,interactive-rtx3090,interactive-rtx2080,gpu-h200,gpu-mig,gpu-mig-a100,gpu-mig-rtxpro6000,dedicated") -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
 
     Args:
@@ -628,38 +650,33 @@ def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-
     Returns:
         (dict): a summary of resources organised by user (and also by node name).
     """
-    version_cmd = "sinfo -V"
-    slurm_version = parse_cmd(version_cmd, split=False).split(" ")[1]
+    slurm_version = _get_slurm_version()
     if slurm_version.startswith("17"):
        resource_flag = "gres"
     else:
        resource_flag = "tres-per-node"
-    
+
     if int(slurm_version[0:2]) >= 21:
         gpu_identifier = 'gres/gpu'
     else:
         gpu_identifier = 'gpu'
 
-    cmd = f"squeue -O {resource_flag}:100,nodelist:100,username:100,jobid:100 --noheader"
+    cmd = f"squeue -a -O {resource_flag}:100,nodelist:100,username:100,jobid:100,BatchFlag:10 --noheader"
     if partition:
         cmd += f" --partition={partition}"
-    detailed_job_cmd = "scontrol show jobid -dd %s"
     rows = parse_cmd(cmd)
     usage = defaultdict(dict)
     for row in rows:
         tokens = row.split()
         # ignore pending jobs
-        if len(tokens) < 4 or not tokens[0].startswith(gpu_identifier):
+        if len(tokens) < 5 or not tokens[0].startswith(gpu_identifier):
             continue
-        gpu_count_str, node_str, user, jobid = tokens
+        gpu_count_str, node_str, user, jobid, batch_flag = tokens
         gpu_count_tokens = gpu_count_str.split(":")
         if not gpu_count_tokens[-1].isdigit():
             gpu_count_tokens.append("1")
         num_gpus = int(gpu_count_tokens[-1])
-        # get detailed job information, to check if using bash
-        detailed_output = parse_cmd(detailed_job_cmd % jobid, split=False)
-        
-        is_bash = any([f'Command={x}\n' in detailed_output for x in INTERACTIVE_CMDS])
+        is_bash = batch_flag.strip() == "0"
         num_bash_gpus = num_gpus * is_bash
         node_names = parse_node_names(node_str)
         for node_name in node_names:
@@ -747,7 +764,7 @@ def available(
     if not states:
         states = node_states()
     res = {key: val for key, val in resources.items()
-           if states.get(key, "down") not in INACCESSIBLE}
+           if not is_inaccessible(states.get(key, "down"))}
     usage = gpu_usage(resources=res)
     for subdict in usage.values():
         for gpu_type, node_dicts in subdict.items():
