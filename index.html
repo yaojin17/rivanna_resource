@@ -17,10 +17,20 @@
     <div id="updateStatus" style="float: right; margin-right: 20px; color: #666;"></div>
      
     <script>
-        var dark_mode_enabled = localStorage.getItem('colorScheme') || "false";
-        if (!localStorage.getItem('colorScheme')) {
-            localStorage.setItem('colorScheme', dark_mode_enabled);
+        // Dark is the default. localStorage carries a deliberate choice only, so
+        // whoever never touched the toggle follows the default; the old
+        // "colorScheme" key is left behind on purpose, because it was written on
+        // every first visit and cannot tell "picked light" from "never picked".
+        var THEME_KEY = "theme";
+
+        function themeIsDark() {
+            return (localStorage.getItem(THEME_KEY) || "dark") === "dark";
         }
+
+        function applyTheme() {
+            document.body.classList.toggle("dark", themeIsDark());
+        }
+
         function applyThemeStyles() {
             // 清除所有内联样式，让CSS规则正常工作
             document.querySelectorAll('table tr, .progress').forEach(function(element) {
@@ -29,21 +39,16 @@
         }
 
         function checkColour(){
-            document.body.classList.toggle("dark", dark_mode_enabled === "true");
+            applyTheme();
             // 应用主题样式
             setTimeout(applyThemeStyles, 100);
         }
 
         function ToggleDarkFn() {
-            document.body.classList.toggle("dark");
-            
-            // 更新状态变量
-            dark_mode_enabled = dark_mode_enabled === "true" ? "false" : "true";
-            localStorage.setItem('colorScheme', dark_mode_enabled);
-            
+            localStorage.setItem(THEME_KEY, themeIsDark() ? "light" : "dark");
+            applyTheme();
             applyThemeStyles();
         }
-        // 删除原来的darkMode函数，使用新的applyThemeStyles   
     </script>
     <div class="account-bar">
         <label for="accountSelect">Account</label>
@@ -60,6 +65,9 @@
 </header>
 
 <body onload="checkColour()">
+<!-- Paint the theme as soon as <body> exists, so a dark page does not flash
+     white while the rest of the document loads. -->
+<script>applyTheme();</script>
 
 
 <details class="section" id="sec-resource">
