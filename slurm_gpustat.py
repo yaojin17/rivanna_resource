@@ -23,6 +23,18 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
+# Same reason as in app.py: the login node is close to its strict-overcommit
+# limit, and a 40-thread OpenBLAS pool is both useless here and large enough to
+# push allocations over it.  Must run before numpy is imported.
+for _blas_var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_blas_var, "1")
+
 import numpy as np
 import colored
 # import seaborn as sns  # Not used in this file
@@ -36,6 +48,9 @@ from django.utils.functional import lazy
 INACCESSIBLE = {"drain*", "down*", "drng", "drain", "down"}
 INACCESSIBLE_KEYWORDS = ("down", "drain", "drng", "resv", "inval", "plnd", "pow_up", "reboot")
 INTERACTIVE_CMDS = {"bash", "zsh", "sh"}
+# How hard parse_cmd tries before letting a SLURM query fail, see its docstring.
+SLURM_RETRIES = 3
+SLURM_RETRY_DELAY = 1.0
 
 
 def is_inaccessible(state: str) -> bool:
@@ -345,17 +360,47 @@ def parse_node_names(node_str):
     return names
 
 
-def parse_cmd(cmd, split=True):
+def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
     """Parse the output of a shell command...
      and if split set to true: split into a list of strings, one per line of output.
+
+    A busy slurmctld sometimes answers a perfectly valid query with a truncated
+    RPC ("Malformed RPC of type RESPONSE_JOB_INFO", "Header lengths are longer
+    than data received"), which makes the client exit non-zero for a second or
+    two.  Every command sent through here is a read-only query, so retry a few
+    times before giving up rather than letting one bad snapshot take out a page.
 
     Args:
         cmd (str): the shell command to be executed.
         split (bool): whether to split the output per line
+        retries (int): how many times to run the command before giving up.
+        delay (float): seconds to wait between attempts.
     Returns:
         (list[str]): the strings from each output line.
+    Raises:
+        subprocess.CalledProcessError: if every attempt failed.
     """
-    output = subprocess.check_output(cmd, shell=True).decode("utf-8")
+    for attempt in range(1, retries + 1):
+        try:
+            output = subprocess.check_output(
+                cmd, shell=True, stderr=subprocess.PIPE
+            ).decode("utf-8")
+            break
+        except subprocess.CalledProcessError as exc:
+            reason = (exc.stderr or b"").decode("utf-8", "replace").strip()
+            reason = " ".join(reason.split()) or "no stderr"
+            if attempt == retries:
+                if retries > 1:
+                    print(
+                        f"Warning: `{cmd}` still failing after {retries} attempts "
+                        f"(exit {exc.returncode}): {reason}"
+                    )
+                raise
+            print(
+                f"Warning: `{cmd}` failed (exit {exc.returncode}): {reason}; "
+                f"retrying in {delay}s ({attempt}/{retries - 1})"
+            )
+            time.sleep(delay)
     if split:
         output = [x for x in output.split("\n") if x]
     return output
@@ -493,8 +538,15 @@ def avail_stats_for_node(node: str) -> dict:
     """
     cmd = f"scontrol show node {node}"
     try:
-        rows = [x.strip() for x in parse_cmd(cmd)]
-    except subprocess.CalledProcessError:
+        # One attempt only: this runs once per node, so retrying every node
+        # would stall the whole page, and the caller copes with the fallback.
+        rows = [x.strip() for x in parse_cmd(cmd, retries=1)]
+    except subprocess.CalledProcessError as exc:
+        reason = " ".join((exc.stderr or b"").decode("utf-8", "replace").split())
+        print(
+            f"Warning: could not read node {node} (exit {exc.returncode}: "
+            f"{reason or 'no stderr'}), reporting it as empty"
+        )
         return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
     keys = ("AllocTRES", "CfgTRES")
     metrics = {}

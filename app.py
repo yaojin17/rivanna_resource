@@ -1,4 +1,19 @@
 import os
+
+# The login node runs with strict overcommit (vm.overcommit_memory=2) and sits
+# close to its commit limit, so the per-core buffers OpenBLAS reserves on one
+# machine with 40 cores are enough to make allocations fail process-wide.  This
+# app only does elementwise integer array work, no BLAS, so pin the pools to a
+# single thread; it must happen before numpy is imported to take effect.
+for _blas_var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_blas_var, "1")
+
 import re
 from datetime import datetime, timedelta
 import argparse
@@ -2326,6 +2341,26 @@ def parse_allocations_to_table():
     return table_html
 
 
+def slurm_response(build, *args, **kwargs):
+    """Render one panel, degrading to a note when SLURM refuses to answer.
+
+    parse_cmd already retries a query that hits a transient controller error; if
+    it still fails the panel says so and the next refresh picks it up again,
+    which beats a 500 and a traceback in the browser.
+    """
+    try:
+        return Response(build(*args, **kwargs), mimetype="text")
+    except CalledProcessError as exc:
+        print(f"Warning: {build.__name__} gave up, SLURM command failed: {exc}")
+        return Response(
+            '<p class="queue-note">SLURM did not answer just now — the '
+            "controller is usually only busy for a few seconds, so the next "
+            "refresh should fill this back in.</p>",
+            mimetype="text",
+            status=503,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="launch web app")
     parser.add_argument(
@@ -2351,27 +2386,15 @@ def main():
 
     @app.route("/resource")
     def resource():
-        def generate():
-            out = parse_usage_to_table()
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_usage_to_table)
 
     @app.route("/queue")
     def queue():
-        def generate():
-            out = parse_queue_to_table()
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_queue_to_table)
 
     @app.route("/queue_stats")
     def queue_stats():
-        def generate():
-            out = parse_queue_stats_to_table()
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_queue_stats_to_table)
 
     @app.route("/wait_estimate")
     def wait_estimate():
@@ -2385,50 +2408,27 @@ def main():
                 status=400,
             )
 
-        def generate():
-            out = parse_wait_estimate_to_table(job)
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_wait_estimate_to_table, job)
 
     @app.route("/priority")
     def priority():
-        def generate():
-            out = parse_priority_to_table()
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_priority_to_table)
 
     @app.route("/leaderboard")
     def leaderboard():
-        def generate():
-            out = parse_leaderboard()
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_leaderboard)
 
     @app.route("/leaderboard_partition")
     def leaderboard_partition():
-        def generate():
-            out = parse_leaderboard_by_partition()
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_leaderboard_by_partition)
 
     @app.route("/disk_quota")
     def disk_quota():
-        def generate():
-            out = parse_disk_quota()
-            yield out
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_disk_quota)
 
     @app.route("/allocations")
     def allocations():
-        def generate():
-            out = parse_allocations_to_table()
-            yield out
-
-        return Response(generate(), mimetype="text")
+        return slurm_response(parse_allocations_to_table)
 
     # @app.route('/cpu_resource')
     # def cpu_resource():
