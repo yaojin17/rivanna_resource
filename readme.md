@@ -13,6 +13,12 @@ The page is one scrolling dashboard. Each block below is a collapsible section t
 refreshes on its own over AJAX, so a slow section never blocks the rest. A dark mode
 toggle, an "Unfold All" button and a manual "Update All" button sit in the header.
 
+An **account picker** sits in the header as well. Allocations, the wait estimate, the
+per-pool priority and the lab queue all follow whichever account is picked, so the page
+shows one account at a time rather than every account at once; the choice is remembered
+across visits. The accounts on offer come from `LAB_ACCOUNTS` in `app.py`, or from the
+`RIVANNA_ACCOUNTS` environment variable as a comma separated list.
+
 ### Resource available
 
 Live GPU, CPU and memory occupancy for every node, grouped by GPU type and sorted by
@@ -37,30 +43,33 @@ between rows; jobs held by a dependency or a QOS/array limit are split out as
 ### Estimated Wait for a Standard Job
 
 Answers "if I submit right now, when do I start?" for each GPU pool. Enter a job shape
-(GPUs, CPUs, memory, walltime, account) and each row replays the scheduler for that
-pool: every pending job `sprio` ranks above a fresh submission of yours is placed
+(GPUs, CPUs, memory, walltime; the account comes from the header picker) and each row
+replays the scheduler for that pool: every pending job `sprio` ranks above a fresh submission of yours is placed
 first, in priority order with backfill, as running jobs free their GPUs.
 `Worst Case` lets every job run to its time limit; `Typical` cuts each job to the
 fraction of its limit that jobs in that partition actually used over the last 3 days.
 
 ![Estimated Wait](screenshots/wait_estimate.png)
 
-### Our Priority in Each Pool
+### Priority in Each Pool
 
-Where a job submitted right now would rank among the jobs already queued *in that
-partition*. Ranking against the whole cluster would be misleading, because the
+Where a job submitted right now under the picked account would rank among the jobs
+already queued *in that partition*. Ranking against the whole cluster would be misleading, because the
 partition factor shown next to each pool is added to every job in it alike.
 
 ![Priority](screenshots/priority.png)
 
 ### Allocations
 
-The lab's service-unit allocations: allocated, remaining, percent used, and which one
-is currently active.
+The picked account's service-unit allocations: allocated, remaining, percent used, and
+which one is currently active. The `allocations` command only reports a balance to
+members of the account, so for an account you are not in the section says so instead of
+showing an empty table.
 
 ![Allocations](screenshots/allocations.png)
 
 ## News
+- [09/10/2026]: Add the header account picker, and keep panels up when SLURM or the login node has a bad moment.
 - [09/03/2026]: Add estimated wait time, queue overview, per-pool priority, collapsible sections, and B200 / RTX PRO 6000 partitions.
 - [08/12/2025]: Add Multi-Instance GPU partition
 - [04/29/2025]: Add disk quota, H200 partition, and manual update button.

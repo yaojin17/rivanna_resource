@@ -45,6 +45,16 @@
         }
         // 删除原来的darkMode函数，使用新的applyThemeStyles   
     </script>
+    <div class="account-bar">
+        <label for="accountSelect">Account</label>
+        <select id="accountSelect" onchange="switchAccount()">
+            {% for account in accounts %}
+            <option value="{{ account }}">{{ account }}</option>
+            {% endfor %}
+        </select>
+        <span class="account-hint">allocations, wait estimate, priority and the lab
+            queue all follow this account</span>
+    </div>
     <h3><div id="clock"></div></h3>
     <hr>
 </header>
@@ -79,7 +89,7 @@
 
 <hr>
 <details class="section" id="sec-allocations">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Allocations for uva_cv_lab</summary>
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Allocations for <span class="acct-name">uva_cv_lab</span></summary>
     <div class='table_big' id='allocations'> </div>
 </details>
 <br>
@@ -93,7 +103,7 @@
 
 <hr>
 <details class="section" id="sec-wait_estimate">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Estimated Wait for a Standard Job</summary>
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Estimated Wait for a Standard Job in <span class="acct-name">uva_cv_lab</span></summary>
     <form class="job-form" id="jobForm" onsubmit="updateWaitEstimate(); return false;">
         <label>GPUs <input type="text" id="jobGpus" value="1" size="4"></label>
         <label>CPUs <input type="text" id="jobCpus" value="auto" size="5"
@@ -101,8 +111,6 @@
         <label>Mem (GB) <input type="text" id="jobMem" value="auto" size="5"
             title="Total memory for the job. 'auto' = this GPU's even share of the node."></label>
         <label>Walltime (h) <input type="text" id="jobHours" value="24" size="4"></label>
-        <label>Account <input type="text" id="jobAccount" value="" size="12"
-            placeholder="uva_cv_lab"></label>
         <button type="submit" id="jobButton">Recalculate</button>
         <button type="button" onclick="resetJobForm()">Reset</button>
     </form>
@@ -112,14 +120,14 @@
 
 <hr>
 <details class="section" id="sec-priority">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Our Priority in Each Pool</summary>
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Priority of <span class="acct-name">uva_cv_lab</span> in Each Pool</summary>
     <div class='table_big' id='priority'> </div>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-queue">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Waiting Queue (Lab)</summary>
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Waiting Queue of <span class="acct-name">uva_cv_lab</span></summary>
     <pre class='terminal' id="queue"> </pre>
 </details>
 
@@ -150,7 +158,39 @@
     var updateButton = document.getElementById("updateButton");
     var updateStatus = document.getElementById("updateStatus");
     var foldButton = document.getElementById("foldButton");
+    var accountSelect = document.getElementById("accountSelect");
     var sections = Array.from(document.querySelectorAll("details.section"));
+
+    // One account drives every account-scoped panel, so the page shows one lab
+    // at a time instead of every account at once.
+    var storedAccount = localStorage.getItem("account");
+    if (storedAccount && Array.from(accountSelect.options).some(function (o) {
+        return o.value === storedAccount;
+    })) {
+        accountSelect.value = storedAccount;
+    }
+
+    function currentAccount() {
+        return accountSelect.value;
+    }
+
+    function accountParam() {
+        return "account=" + encodeURIComponent(currentAccount());
+    }
+
+    function applyAccountLabels() {
+        document.querySelectorAll(".acct-name").forEach(function (el) {
+            el.textContent = currentAccount();
+        });
+    }
+
+    function switchAccount() {
+        localStorage.setItem("account", currentAccount());
+        applyAccountLabels();
+        updateAll();
+    }
+
+    applyAccountLabels();
 
     // Sections start folded; whatever the user opens is remembered per section.
     sections.forEach(function (section) {
@@ -183,9 +223,8 @@
     // 页面加载时自动更新
     window.onload = updateAll;
 
-    var jobFields = {gpus: "jobGpus", cpus: "jobCpus", mem: "jobMem",
-                     hours: "jobHours", account: "jobAccount"};
-    var jobDefaults = {gpus: "1", cpus: "auto", mem: "auto", hours: "24", account: ""};
+    var jobFields = {gpus: "jobGpus", cpus: "jobCpus", mem: "jobMem", hours: "jobHours"};
+    var jobDefaults = {gpus: "1", cpus: "auto", mem: "auto", hours: "24"};
 
     // The form lives outside #wait_estimate so it survives every refresh.
     Object.keys(jobFields).forEach(function (key) {
@@ -212,6 +251,7 @@
         jobButton.disabled = true;
         jobButton.textContent = "Calculating...";
         try {
+            params.set("account", currentAccount());
             var response = await fetch("{{ url_for('wait_estimate') }}?" + params.toString());
             wait_estimate.innerHTML = await response.text();
         } catch (err) {
@@ -253,13 +293,13 @@
 
             // Update priority ranking
             updateStatus.textContent = "Updating priority ranking...";
-            await fetch("{{ url_for('priority') }}")
+            await fetch("{{ url_for('priority') }}?" + accountParam())
                 .then(response => response.text())
                 .then(t => {priority.innerHTML = t;});
 
             // Update queue information
             updateStatus.textContent = "Updating queue info...";
-            await fetch("{{ url_for('queue') }}")
+            await fetch("{{ url_for('queue') }}?" + accountParam())
                 .then(response => response.text())
                 .then(t => {queue.innerHTML = t;});
 
@@ -271,7 +311,7 @@
 
             // Update allocation information
             updateStatus.textContent = "Updating allocations...";
-            await fetch("{{ url_for('allocations') }}")
+            await fetch("{{ url_for('allocations') }}?" + accountParam())
                 .then(response => response.text())
                 .then(t => {allocations.innerHTML = t;});
 
@@ -559,6 +599,32 @@
     }
 
     body.dark .mig-details summary {
+        color: #999;
+    }
+
+    .account-bar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin: 6px 0 2px 0;
+        font-size: 0.95em;
+    }
+
+    .account-bar label {
+        font-weight: bold;
+    }
+
+    .account-bar select {
+        padding: 2px 5px;
+        font-size: 1em;
+    }
+
+    .account-hint {
+        color: #888;
+        font-size: 0.85em;
+    }
+
+    body.dark .account-hint {
         color: #999;
     }
 

@@ -379,6 +379,33 @@ def _state_badge(state):
 
 MONITORED_PARTITIONS = "gpu,gpu-a100-40,gpu-a100-80,gpu-a40,gpu-a6000,gpu-v100,gpu-b200,gpu-rtxpro6000,gpu-mig,gpu-mig-a100,gpu-mig-rtxpro6000,interactive,interactive-rtx2080,interactive-rtx3090,dedicated"
 
+# The accounts offered in the page's account picker; the first one is what the
+# page starts on. Everything account-scoped -- the allocation, priority, queue
+# and wait-estimate panels -- follows whichever one is picked, so only accounts
+# we would really submit under belong here.  uva_cv_lab2 is the paid account and
+# is off limits, and dac_cheng has had no allocation since early 2026.
+LAB_ACCOUNTS = tuple(
+    a.strip()
+    for a in os.environ.get("RIVANNA_ACCOUNTS", "uva_cv_lab,cang-lab-in-silico").split(",")
+    if a.strip()
+)
+
+
+def selected_account(args):
+    """The account a request asked for, checked against the picker's list.
+
+    A whitelist rather than a pattern match: these names are interpolated into
+    the SLURM commands below, and an account nobody is a member of would only
+    produce empty panels with no hint as to why.
+    """
+    wanted = args.get("account", "").strip()
+    if not wanted:
+        return LAB_ACCOUNTS[0]
+    if wanted not in LAB_ACCOUNTS:
+        print(f"Warning: unknown account {wanted!r} requested, using {LAB_ACCOUNTS[0]}")
+        return LAB_ACCOUNTS[0]
+    return wanted
+
 
 def _is_mig_type(gpu_type):
     """MIG slice types are named after their memory share, e.g. "1g.10gb"."""
@@ -911,8 +938,8 @@ def parse_queue_stats_to_table():
 # Asking SLURM to schedule that job with --test-only gives the real backfill
 # estimate, so no priority arithmetic has to be reimplemented here. Every field
 # can be overridden from the web form; the defaults below are what the form
-# starts with.
-STANDARD_JOB_ACCOUNT = os.environ.get("RIVANNA_STANDARD_ACCOUNT", "uva_cv_lab")
+# starts with. The account is not one of them -- it comes from the page's
+# account picker, so that every panel is talking about the same account.
 STANDARD_JOB_HOURS = int(os.environ.get("RIVANNA_STANDARD_HOURS", "24"))
 # Guard rails for the values arriving from the browser.
 STANDARD_JOB_MAX_GPUS = 64
@@ -934,6 +961,9 @@ NO_ACCESS_MARKERS = (
     "Invalid account",
     "Access/permission denied",
 )
+# The one no-access reason that is about the account rather than the pool: it is
+# what sbatch says when the submitter is not a member of the account at all.
+NOT_A_MEMBER_MARKER = "Invalid account"
 # Pools already reported as inaccessible, so the log is not repeated on every refresh.
 _reported_no_access = set()
 # Union partitions already reported as skipped, for the same reason.
@@ -962,7 +992,7 @@ def _int_arg(args, name, default, minimum, maximum, allow_auto=False):
 
 def parse_standard_job_args(args):
     """Turn the web form's query string into validated standard-job settings."""
-    account = args.get("account", "").strip() or STANDARD_JOB_ACCOUNT
+    account = selected_account(args)
     if not ACCOUNT_PATTERN.match(account):
         raise InvalidJobRequest(f"account {account!r} is not a valid SLURM account name")
     return {
@@ -1720,7 +1750,7 @@ def parse_wait_estimate_to_table(job=None):
         failure = _test_only_check(spec, job["account"])
         if failure is not None:
             if failure[0] == "no_access":
-                no_access.append(spec)
+                no_access.append((spec, failure[1]))
             else:
                 unavailable.append((spec, failure[1]))
             continue
@@ -1910,30 +1940,38 @@ def parse_wait_estimate_to_table(job=None):
             f"{rows_html}</table></details>"
         )
     if no_access:
-        pools_text = ", ".join(
-            f"{spec['gpu_type']}/{spec['partition']}"
-            for spec in sorted(no_access, key=lambda s: (s["partition"], s["gpu_type"]))
-        )
-        table_html += (
-            f'<p class="queue-note">Left out: {pools_text} &mdash; no node in those pools is '
-            f"schedulable by <b>{job['account']}</b> (another group's reservation or a "
-            "partition we are not in), so there is nothing to estimate.</p>"
-        )
+        # "Invalid account" is a statement about the account, not the pool, and
+        # it makes every other pool's verdict beside the point; saying "another
+        # group's reservation" there would send the reader looking in the wrong
+        # place. It does not come back for every pool, because SLURM rejects
+        # some on node configuration before it ever looks at the account.
+        not_member = [reason for _, reason in no_access if NOT_A_MEMBER_MARKER in reason]
+        if not_member:
+            table_html += (
+                f'<p class="queue-note">SLURM will not schedule anything under '
+                f"<b>{job['account']}</b> for you: <code>{not_member[0]}</code>. "
+                "You are most likely not a member of that account yet, so what is "
+                "above is the queue as it stands, not a queue you can join.</p>"
+            )
+        else:
+            pools_text = ", ".join(
+                f"{spec['gpu_type']}/{spec['partition']}"
+                for spec, _ in sorted(no_access, key=lambda p: (p[0]["partition"], p[0]["gpu_type"]))
+            )
+            table_html += (
+                f'<p class="queue-note">Left out: {pools_text} &mdash; no node in those pools is '
+                f"schedulable by <b>{job['account']}</b> (another group's reservation or a "
+                "partition we are not in), so there is nothing to estimate.</p>"
+            )
     return table_html
 
 
 # ------------------------------------------------------------------- priority
-# Where a freshly submitted job from each lab account would land in the queue it
-# actually competes in. The comparison has to be made *inside* a partition: the
-# partition priority factor is added to every job in that partition alike, so
-# ranking against the whole cluster makes a pool's factor look like our own
+# Where a freshly submitted job from the picked account would land in the queue
+# it actually competes in. The comparison has to be made *inside* a partition:
+# the partition priority factor is added to every job in that partition alike,
+# so ranking against the whole cluster makes a pool's factor look like our own
 # advantage or handicap when it cancels out.
-#
-# Only the account we actually submit under is ranked. uva_cv_lab2 is the paid
-# account and is off limits, and dac_cheng has had no allocation since early
-# 2026; listing either one would advertise a queue position nobody should use,
-# and their flattering fairshare is only an artefact of sitting idle.
-PRIORITY_ACCOUNTS = ("uva_cv_lab",)
 
 
 def _priority_weights():
@@ -1962,7 +2000,7 @@ def _qos_priorities():
     return priorities
 
 
-def _account_priority_profile(accounts=PRIORITY_ACCOUNTS):
+def _account_priority_profile(accounts=LAB_ACCOUNTS):
     """Fairshare factor and highest-priority QOS available to each of ``accounts``."""
     account_list = ",".join(accounts)
     shares = defaultdict(list)
@@ -2050,15 +2088,16 @@ def _partition_priority_data():
     return totals, factors
 
 
-def parse_priority_to_table():
-    """Rank a freshly submitted job from each lab account inside every GPU pool."""
-    profile, max_qos = _account_priority_profile()
-    if not profile or not max_qos:
-        return "<p>Could not read the account priority settings from SLURM.</p>"
+def parse_priority_to_table(account=None):
+    """Rank a freshly submitted job from ``account`` inside every GPU pool."""
+    account = account or LAB_ACCOUNTS[0]
+    profile, max_qos = _account_priority_profile((account,))
+    if account not in profile or not max_qos:
+        return f"<p>Could not read the priority settings of <b>{account}</b> from SLURM.</p>"
     weights = _priority_weights()
     totals, factors = _partition_priority_data()
 
-    accounts = [a for a in PRIORITY_ACCOUNTS if a in profile]
+    accounts = [account]
     partitions = [p for p in _partition_nodes() if p in totals]
     partitions.sort(key=lambda p: factors.get(p, 0), reverse=True)
     if not partitions:
@@ -2118,29 +2157,21 @@ def parse_priority_to_table():
     )
     return f"<table>{header}{body}</table>{note}"
 
-def parse_queue_to_table():
-    """Request pending queue for uva_cv_lab, uva_cv_lab2, and dac_cheng accounts, returning combined output with raw formatting."""
+def parse_queue_to_table(account=None):
+    """Pending jobs of ``account``, kept in squeue's own column formatting.
 
-    # Command templates to fetch pending jobs for uva_cv_lab and uva_cv_lab2 accounts
-    cmd_uva_cv_lab = (
-        "squeue -a -t PENDING -A uva_cv_lab -o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
+    The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
+    carries no shell syntax.
+    """
+    account = account or LAB_ACCOUNTS[0]
+    cmd = (
+        f"squeue -a -t PENDING -A {account} "
+        "-o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
     )
-    cmd_uva_cv_lab2 = (
-        "squeue -a -t PENDING -A uva_cv_lab2 -o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
-    )
-    cmd_dac_cheng = (
-        "squeue -a -t PENDING -A dac_cheng -o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
-    )
-
-    # Fetch and combine outputs
-    out_uva_cv_lab = parse_cmd(cmd_uva_cv_lab)
-    out_uva_cv_lab2 = parse_cmd(cmd_uva_cv_lab2)
-    out_dac_cheng = parse_cmd(cmd_dac_cheng)
-
-    # Combine all queues and format output as a single string
-    combined_output = "\n".join(out_uva_cv_lab + out_uva_cv_lab2 + out_dac_cheng)
-
-    return combined_output
+    rows = parse_cmd(cmd)
+    if len(rows) <= 1:
+        return f"no pending job in {account}"
+    return "\n".join(rows)
 
 
 def parse_disk_io():
@@ -2272,30 +2303,45 @@ def parse_disk_quota():
         return f"<p>{error_msg}</p>"
 
 
-def parse_allocations_to_table():
-    """Run 'allocations -a uva_cv_lab' command and parse the output to an HTML table."""
-    cmd = "allocations -a uva_cv_lab"
+def parse_allocations_to_table(account=None):
+    """Run 'allocations -a <account>' and parse the output to an HTML table.
+
+    The command only prints the balance table to members of the account; for
+    everyone else it lists the members and nothing else, which is why an empty
+    table is reported as "not a member" rather than "no allocation".
+    """
+    account = account or LAB_ACCOUNTS[0]
+    cmd = f"allocations -a {account}"
     output = parse_cmd(cmd)
     if not output:
-        return "<p>No allocation information found.</p>"
+        return f"<p>No allocation information found for {account}.</p>"
 
-    # The output has a header, separator, and data rows
+    # For a member the output is the balance table followed by the member list;
+    # for everyone else only the member list is printed.  Both tables are laid
+    # out the same way, so find the balance table by its own header rather than
+    # by counting separators, or the member rows get read as balances.
+    header_idx = next(
+        (i for i, line in enumerate(output) if "Allocated" in line and "Remaining" in line),
+        None,
+    )
+    if header_idx is None:
+        return (
+            f'<p class="queue-note">No allocation balance is visible for '
+            f"<b>{account}</b>. The <code>allocations</code> command only shows it "
+            "to members of the account.</p>"
+        )
+
     allocation_lines = []
-    separator_count = 0
-    for line in output:
+    for line in output[header_idx + 1 :]:
         if "------" in line:
-            separator_count += 1
             continue
-        if separator_count == 0:
-            continue  # Skip lines before the first separator
-        elif separator_count == 1:
-            if line.strip():
-                allocation_lines.append(line.rstrip("\n"))
-        else:
-            break  # Stop after the allocation table
+        # The member list that follows starts with its own header.
+        if "CommonName" in line or line.startswith("PI:"):
+            break
+        allocation_lines.append(line.rstrip("\n"))
 
     if not allocation_lines:
-        return "<p>No allocation data found.</p>"
+        return f"<p>No allocation data found for {account}.</p>"
 
     columns = [
         "Description",
@@ -2313,11 +2359,13 @@ def parse_allocations_to_table():
         table_html += f"<th>{col}</th>"
     table_html += "</tr>"
 
-    # Parse each data row by splitting on whitespace
+    # Parse each data row by splitting on whitespace. StartTime is a date and a
+    # time, so a complete row has eight fields for the seven columns.
     for row in allocation_lines:
         parts = row.split()
-        if len(parts) < 7:
-            continue  # Skip rows that don't have all columns
+        if len(parts) < 8:
+            print(f"Warning: incomplete allocation row {row!r} for {account}, skipping")
+            continue
 
         table_html += "<tr>"
         # Description
@@ -2342,23 +2390,29 @@ def parse_allocations_to_table():
 
 
 def slurm_response(build, *args, **kwargs):
-    """Render one panel, degrading to a note when SLURM refuses to answer.
+    """Render one panel, degrading to a note when the query cannot be made.
 
-    parse_cmd already retries a query that hits a transient controller error; if
-    it still fails the panel says so and the next refresh picks it up again,
-    which beats a 500 and a traceback in the browser.
+    parse_cmd already retries both a transient controller error and a login node
+    too short of memory to fork; if it still fails the panel says which of the
+    two it was and the next refresh picks it up again, which beats a 500 and a
+    traceback in the browser.
     """
     try:
         return Response(build(*args, **kwargs), mimetype="text")
     except CalledProcessError as exc:
         print(f"Warning: {build.__name__} gave up, SLURM command failed: {exc}")
-        return Response(
-            '<p class="queue-note">SLURM did not answer just now — the '
-            "controller is usually only busy for a few seconds, so the next "
-            "refresh should fill this back in.</p>",
-            mimetype="text",
-            status=503,
+        note = (
+            "SLURM did not answer just now &mdash; the controller is usually only "
+            "busy for a few seconds, so the next refresh should fill this back in."
         )
+    except OSError as exc:
+        print(f"Warning: {build.__name__} gave up, could not run a SLURM command: {exc}")
+        note = (
+            "This login node could not start the SLURM commands just now "
+            f"(<code>{exc}</code>). It is out of memory rather than out of GPUs; "
+            "try again in a moment, or from a less loaded login node."
+        )
+    return Response(f'<p class="queue-note">{note}</p>', mimetype="text", status=503)
 
 
 def main():
@@ -2375,7 +2429,11 @@ def main():
 
     @app.route("/")
     def index():
-        return render_template_string(open("index.html").read(), hostname=args.host)
+        return render_template_string(
+            open("index.html").read(),
+            hostname=args.host,
+            accounts=LAB_ACCOUNTS,
+        )
 
     @app.route("/time_feed")
     def time_feed():
@@ -2390,7 +2448,7 @@ def main():
 
     @app.route("/queue")
     def queue():
-        return slurm_response(parse_queue_to_table)
+        return slurm_response(parse_queue_to_table, selected_account(request.args))
 
     @app.route("/queue_stats")
     def queue_stats():
@@ -2412,7 +2470,7 @@ def main():
 
     @app.route("/priority")
     def priority():
-        return slurm_response(parse_priority_to_table)
+        return slurm_response(parse_priority_to_table, selected_account(request.args))
 
     @app.route("/leaderboard")
     def leaderboard():
@@ -2428,7 +2486,7 @@ def main():
 
     @app.route("/allocations")
     def allocations():
-        return slurm_response(parse_allocations_to_table)
+        return slurm_response(parse_allocations_to_table, selected_account(request.args))
 
     # @app.route('/cpu_resource')
     # def cpu_resource():

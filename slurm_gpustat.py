@@ -364,11 +364,14 @@ def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
     """Parse the output of a shell command...
      and if split set to true: split into a list of strings, one per line of output.
 
-    A busy slurmctld sometimes answers a perfectly valid query with a truncated
-    RPC ("Malformed RPC of type RESPONSE_JOB_INFO", "Header lengths are longer
-    than data received"), which makes the client exit non-zero for a second or
-    two.  Every command sent through here is a read-only query, so retry a few
-    times before giving up rather than letting one bad snapshot take out a page.
+    Two transient failures are worth riding out rather than propagating.  A busy
+    slurmctld sometimes answers a perfectly valid query with a truncated RPC
+    ("Malformed RPC of type RESPONSE_JOB_INFO", "Header lengths are longer than
+    data received"), which makes the client exit non-zero for a second or two.
+    And the login node runs with strict overcommit while sitting near its commit
+    limit, so starting the child at all can fail with ENOMEM.  Every command sent
+    through here is a read-only query, so retry a few times before giving up
+    rather than letting one bad moment take out a page.
 
     Args:
         cmd (str): the shell command to be executed.
@@ -378,7 +381,8 @@ def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
     Returns:
         (list[str]): the strings from each output line.
     Raises:
-        subprocess.CalledProcessError: if every attempt failed.
+        subprocess.CalledProcessError: if the command ran and failed every time.
+        OSError: if the command could not be started at all.
     """
     for attempt in range(1, retries + 1):
         try:
@@ -386,18 +390,18 @@ def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
                 cmd, shell=True, stderr=subprocess.PIPE
             ).decode("utf-8")
             break
-        except subprocess.CalledProcessError as exc:
-            reason = (exc.stderr or b"").decode("utf-8", "replace").strip()
-            reason = " ".join(reason.split()) or "no stderr"
+        except (subprocess.CalledProcessError, OSError) as exc:
+            if isinstance(exc, subprocess.CalledProcessError):
+                reason = " ".join((exc.stderr or b"").decode("utf-8", "replace").split())
+                detail = f"exit {exc.returncode}: {reason or 'no stderr'}"
+            else:
+                detail = f"could not be started: {exc}"
             if attempt == retries:
                 if retries > 1:
-                    print(
-                        f"Warning: `{cmd}` still failing after {retries} attempts "
-                        f"(exit {exc.returncode}): {reason}"
-                    )
+                    print(f"Warning: `{cmd}` still failing after {retries} attempts ({detail})")
                 raise
             print(
-                f"Warning: `{cmd}` failed (exit {exc.returncode}): {reason}; "
+                f"Warning: `{cmd}` failed ({detail}); "
                 f"retrying in {delay}s ({attempt}/{retries - 1})"
             )
             time.sleep(delay)
