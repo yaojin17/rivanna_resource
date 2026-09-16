@@ -17,6 +17,8 @@ for _blas_var in (
 import re
 from datetime import datetime, timedelta
 import argparse
+import functools
+import pwd
 import bisect
 import copy
 import time
@@ -127,6 +129,21 @@ def str_to_int(text):
         return 0
 
 
+@functools.lru_cache(maxsize=None)
+def display_name(user):
+    """Return "Real Name (computing_id)" using the passwd GECOS field."""
+    try:
+        gecos = pwd.getpwnam(user).pw_gecos
+    except KeyError:
+        print(f"Warning: no passwd entry for user {user!r}, showing raw id")
+        return user
+    name = gecos.split(",")[0].replace("_", " ").strip()
+    if not name:
+        print(f"Warning: empty GECOS name for user {user!r}, showing raw id")
+        return user
+    return f"{name} ({user})"
+
+
 def parse_leaderboard(sum_by_gmem=[48]):
     """Request sinfo, parse the leaderboard in string."""
 
@@ -145,6 +162,7 @@ def parse_leaderboard(sum_by_gmem=[48]):
             for key, val in subdict.items()
         }
     out = ""
+    name_width = max((len(display_name(u)) for u in aggregates), default=12) + 2
     for user, subdict in sorted(
         aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
     ):
@@ -165,7 +183,7 @@ def parse_leaderboard(sum_by_gmem=[48]):
             total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
         total += f"|newer={str(sum(num_new_gpus)):2s}"
         total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
-        out += f"{user:12s}[{total}]    {summary_str}\n"
+        out += f"{display_name(user):{name_width}s}[{total}]    {summary_str}\n"
     return out
 
 
@@ -191,6 +209,7 @@ def parse_leaderboard_by_partition(sum_by_gmem=[48]):
         if i != 0:
             out += "-" * 64 + "\n"
         out += f"PARTITION: {part}\n"
+        name_width = max((len(display_name(u)) for u in aggregates), default=12) + 2
         for user, subdict in sorted(
             aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
         ):
@@ -211,7 +230,7 @@ def parse_leaderboard_by_partition(sum_by_gmem=[48]):
                 total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
             total += f"|newer={str(sum(num_new_gpus)):2s}"
             total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
-            out += f"{user:12s}[{total}]    {summary_str}\n"
+            out += f"{display_name(user):{name_width}s}[{total}]    {summary_str}\n"
     out += "=" * 64 + "\n"
     return out
 
