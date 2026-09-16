@@ -426,6 +426,43 @@ def selected_account(args):
     return wanted
 
 
+def _reserved_for_others():
+    """Nodes held by an active reservation that none of LAB_ACCOUNTS may use.
+
+    sinfo only reports a reserved node as ``resv`` while it is idle; once any job
+    runs on it the state reads plain ``mix``, so without this a node like
+    udc-ba07-38 (reservation dac_ssz, one CPU in use, eight idle A40s) looks
+    wide open. Returns ``{node: reservation name}``.
+
+    Access is judged by account only. A reservation granted to users or groups
+    (maintenance windows held for root, say) is treated as closed, and
+    ``Accounts=-name`` is SLURM's "everyone except" form.
+    """
+    locked = {}
+    for row in parse_cmd("scontrol show reservation -o"):
+        fields = dict(
+            token.split("=", 1) for token in row.split() if "=" in token
+        )
+        name = fields.get("ReservationName", "?")
+        if fields.get("State") != "ACTIVE":
+            continue
+        nodes = fields.get("Nodes", "(null)")
+        if nodes in ("", "(null)"):
+            print(f"Warning: active reservation {name} names no nodes, ignoring it")
+            continue
+        accounts = fields.get("Accounts", "(null)")
+        listed = set() if accounts == "(null)" else set(accounts.lstrip("-").split(","))
+        if accounts.startswith("-"):
+            ours = not (listed & set(LAB_ACCOUNTS))
+        else:
+            ours = bool(listed & set(LAB_ACCOUNTS))
+        if ours:
+            continue
+        for node in parse_node_names(nodes):
+            # A node in two closed reservations just keeps the first name.
+            locked.setdefault(node, name)
+    return locked
+
 def _is_mig_type(gpu_type):
     """MIG slice types are named after their memory share, e.g. "1g.10gb"."""
     return gpu_type[0].isdigit() if gpu_type else False
@@ -442,6 +479,12 @@ def _gpu_pools():
     """
     resources = parse_all_gpus(partition=MONITORED_PARTITIONS)
     states = node_states(partition=MONITORED_PARTITIONS)
+    reserved = {
+        node: name for node, name in _reserved_for_others().items() if node in resources
+    }
+    # Reserved for somebody else is as good as down for us, whatever sinfo says.
+    for node in reserved:
+        states[node] = "resv"
 
     # Separate accessible vs inaccessible nodes
     res_accessible = {
@@ -468,6 +511,7 @@ def _gpu_pools():
 
     return {
         "states": states,
+        "reserved": reserved,
         "usage": usage,
         "down_nodes": res_down,
         "total_by_node": res_total,
@@ -485,6 +529,7 @@ def parse_usage_to_table(show_bar=True):
     states = pools["states"]
     usage = pools["usage"]
     res_down = pools["down_nodes"]
+    reserved = pools["reserved"]
     res_total_by_type = pools["total_by_type"]
     res_usage_by_type = pools["free_by_type"]
     res_down_by_type = pools["down_by_type"]
@@ -498,6 +543,13 @@ def parse_usage_to_table(show_bar=True):
     )
     gpu_type_list = [t for t in type_list if not _is_mig_type(t)]
     mig_type_list = [t for t in type_list if _is_mig_type(t)]
+
+    def _down_note(entries):
+        """"(8 offline, 8 reserved)" for down-bucket entries, split by cause."""
+        held = sum(x["count"] for x in entries if x["node"] in reserved)
+        offline = sum(x["count"] for x in entries) - held
+        parts = [f"{offline} offline"] * bool(offline) + [f"{held} reserved"] * bool(held)
+        return f' <span class="down-note">({", ".join(parts)})</span>' if parts else ""
 
     def _render_type_rows(type_list_to_render):
         rows_html = []
@@ -557,6 +609,11 @@ def parse_usage_to_table(show_bar=True):
             for node in down_node_names:
                 node_state = states.get(node, "unknown")
                 state_html = f"<td>{_state_badge(node_state)}</td>"
+                if node in reserved:
+                    state_html = (
+                        f"<td>{_state_badge(node_state)} "
+                        f'<span class="queue-muted">{reserved[node]}</span></td>'
+                    )
                 node_name_td = f"<td>{node}</td>"
                 node_gpu_count = sum(x["count"] for x in res_down[node])
                 down_summaries.append(
@@ -567,16 +624,12 @@ def parse_usage_to_table(show_bar=True):
 
             type_total = sum(gpu_count_total.values())
             type_avail = sum(gpu_count_avail.values())
-            type_down_total = sum(x["count"] for x in down_node_dicts)
-
             if show_bar:
                 type_bar = get_resource_bar(type_avail, type_total, text=f"{type_avail} / {type_total}")
             else:
                 type_bar = f"{type_avail}/{type_total}"
 
-            down_note = ""
-            if type_down_total > 0:
-                down_note = f' <span class="down-note">({type_down_total} offline)</span>'
+            down_note = _down_note(down_node_dicts)
 
             rows_html.append(
                 f'<tr><td colspan="7"><b>{gpu_type} {GMEM.get(gpu_type, "")}: {type_bar} gpus available{down_note}</b></td></tr>'
@@ -586,12 +639,8 @@ def parse_usage_to_table(show_bar=True):
             total_count += type_total
             avail_count += type_avail
 
-        down_total = sum(
-            x["count"]
-            for t in type_list_to_render
-            for x in res_down_by_type.get(t, [])
-        )
-        return "".join(rows_html), avail_count, total_count, down_total
+        down_entries = [x for t in type_list_to_render for x in res_down_by_type.get(t, [])]
+        return "".join(rows_html), avail_count, total_count, down_entries
 
     gpu_rows, gpu_avail, gpu_total, gpu_down = _render_type_rows(gpu_type_list)
     mig_rows, mig_avail, mig_total, mig_down = _render_type_rows(mig_type_list)
@@ -600,9 +649,7 @@ def parse_usage_to_table(show_bar=True):
         total_bar = get_resource_bar(gpu_avail, gpu_total, text=f"{gpu_avail} / {gpu_total}")
     else:
         total_bar = f"{gpu_avail}/{gpu_total}"
-    down_note = ""
-    if gpu_down > 0:
-        down_note = f' <span class="down-note">({gpu_down} offline)</span>'
+    down_note = _down_note(gpu_down)
     total_summary = f'<tr><td colspan="7"><h3>Summary: {total_bar} gpus available{down_note}</h3></td></tr>'
 
     table_html = f"<table>{total_summary}{gpu_rows}</table>"
@@ -612,9 +659,7 @@ def parse_usage_to_table(show_bar=True):
             mig_bar = get_resource_bar(mig_avail, mig_total, text=f"{mig_avail} / {mig_total}")
         else:
             mig_bar = f"{mig_avail}/{mig_total}"
-        mig_down_note = ""
-        if mig_down > 0:
-            mig_down_note = f' <span class="down-note">({mig_down} offline)</span>'
+        mig_down_note = _down_note(mig_down)
         table_html += (
             f'<details class="mig-details"><summary>MIG: {mig_bar} slices available{mig_down_note}</summary>'
             f"<table>{mig_rows}</table></details>"
@@ -2177,20 +2222,51 @@ def parse_priority_to_table(account=None):
     return f"<table>{header}{body}</table>{note}"
 
 def parse_queue_to_table(account=None):
-    """Pending jobs of ``account``, kept in squeue's own column formatting.
+    """Pending jobs of ``account``, laid out like squeue's own columns.
+
+    START_TIME is SLURM's own estimate (what ``squeue --start`` reports), filled
+    in by the backfill scheduler; it reads N/A for jobs it has not planned, such
+    as held ones. State and elapsed time are left out because every row here is
+    PENDING at 0:00. Both timestamps drop the year, which only widened the table.
 
     The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
     carries no shell syntax.
     """
     account = account or LAB_ACCOUNTS[0]
-    cmd = (
-        f"squeue -a -t PENDING -A {account} "
-        "-o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
-    )
-    rows = parse_cmd(cmd)
-    if len(rows) <= 1:
+    rows = parse_cmd(f"squeue -a -h -t PENDING -A {account} -o '%i|%P|%u|%l|%D|%V|%S|%R'")
+    if not rows:
         return f"no pending job in {account}"
-    return "\n".join(rows)
+
+    def _short(stamp):
+        # 2026-09-17T16:15:17 -> 09-17 16:15; N/A and the like pass through.
+        match = re.fullmatch(r"\d{4}-(\d\d-\d\d)T(\d\d:\d\d):\d\d", stamp)
+        return f"{match.group(1)} {match.group(2)}" if match else stamp
+
+    def _limit(text):
+        # 3-00:00:00 -> 3d, 1-12:00:00 -> 1d12h, 12:00:00 -> 12h. Rounded up to
+        # the hour, so a limit is never shown shorter than it really is.
+        minutes = _slurm_time_to_minutes(text)
+        if minutes is None:
+            return text
+        days, hours = divmod(-(-minutes // 60), 24)
+        if not days:
+            return f"{hours}h"
+        return f"{days}d{hours}h" if hours else f"{days}d"
+
+    line = "{:>10} {:>14} {:>8} {:>6} {:>5} {:>11} {:>11}  {}"
+    out = [line.format("JOBID", "PARTITION", "USER", "LIMIT", "NODES",
+                       "SUBMIT_TIME", "START_TIME", "NODELIST(REASON)")]
+    for row in rows:
+        fields = row.split("|", 7)
+        if len(fields) < 8:
+            print(f"Warning: unexpected squeue row {row!r} for {account}, skipping")
+            continue
+        jobid, partition, user, limit, nodes, submit, start, reason = fields
+        # A job queued on several partitions lists all of them; cut it to the
+        # column like squeue itself would rather than stretching every row.
+        out.append(line.format(jobid, partition[:14], user, _limit(limit), nodes,
+                               _short(submit), _short(start), reason))
+    return "\n".join(out)
 
 
 def parse_disk_io():
