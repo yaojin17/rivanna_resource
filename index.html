@@ -70,6 +70,13 @@
 <script>applyTheme();</script>
 
 
+<details class="section" id="sec-my_jobs">
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> My Running Jobs (live)</summary>
+    <div class='table_big' id='my_jobs'> </div>
+</details>
+<br>
+
+<hr>
 <details class="section" id="sec-resource">
     <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Resource available</summary>
     <div id="resource"> </div>
@@ -163,6 +170,8 @@
     var priority = document.getElementById("priority");
     var leaderboard = document.getElementById("leaderboard");
     var allocations = document.getElementById("allocations");
+    var my_jobs = document.getElementById("my_jobs");
+    var myJobsSection = document.getElementById("sec-my_jobs");
     var updateButton = document.getElementById("updateButton");
     var updateStatus = document.getElementById("updateStatus");
     var foldButton = document.getElementById("foldButton");
@@ -270,6 +279,37 @@
         }
     }
 
+    // Reading a job's card means starting a short step inside it, so this panel
+    // is only fetched while its section is open: folded, it costs the cluster
+    // nothing, and opening it fills it in straight away.  Opening the section
+    // and the update button both refresh it outright; updateAll skips it when
+    // it was read moments ago, so idly switching back to the tab does not keep
+    // launching steps across every running job.
+    // The same gap the server needs between two CPU readings to report a live
+    // number rather than the run average, so a refresh that gets through always
+    // has one to show.
+    var myJobsFetchedAt = 0;
+    var MY_JOBS_MIN_GAP_MS = {{ my_jobs_min_gap_ms }};
+
+    async function updateMyJobs() {
+        myJobsFetchedAt = Date.now();
+        my_jobs.innerHTML = "<p>Reading the cards...</p>";
+        try {
+            var response = await fetch("{{ url_for('my_jobs') }}");
+            my_jobs.innerHTML = await response.text();
+        } catch (err) {
+            my_jobs.innerHTML = "<p>Failed to read my running jobs: " + err + "</p>";
+        }
+        applyThemeStyles();
+    }
+
+    // A section restored open fires this toggle once the page settles, and the
+    // updateAll that runs on load would fetch it again; the throttle above
+    // collapses the two into one read.
+    myJobsSection.addEventListener("toggle", function () {
+        if (myJobsSection.open) updateMyJobs();
+    });
+
     async function updateAll() {
         // Disable update button
         updateButton.disabled = true;
@@ -322,6 +362,12 @@
             await fetch("{{ url_for('allocations') }}?" + accountParam())
                 .then(response => response.text())
                 .then(t => {allocations.innerHTML = t;});
+
+            // Update my own running jobs
+            if (myJobsSection.open && Date.now() - myJobsFetchedAt > MY_JOBS_MIN_GAP_MS) {
+                updateStatus.textContent = "Reading my running jobs...";
+                await updateMyJobs();
+            }
 
             // Update disk quota information
             updateStatus.textContent = "Updating disk quota...";
@@ -703,6 +749,49 @@
 
     body.dark .queue-pressure-high {
         color: #f5a0a0;
+    }
+
+    .job-name {
+        color: #666;
+        font-size: 0.85em;
+    }
+
+    body.dark .job-name {
+        color: #999;
+    }
+
+    .cpu-average {
+        color: #888;
+        font-size: 0.8em;
+        font-style: italic;
+    }
+
+    body.dark .cpu-average {
+        color: #999;
+    }
+
+    /* This table has eleven columns, so it needs the full width rather than the
+       62% the other .table_big panels use. */
+    #my_jobs table {
+        width: 100%;
+        font-size: 15px;
+    }
+
+    /* Every cell here is a short reading, and a column that wraps doubles the
+       height of the whole row, so keep them all on one line. */
+    #my_jobs td, #my_jobs th {
+        padding: 5px;
+        white-space: nowrap;
+    }
+
+    /* The overlaid text is the point of these bars ("276/300W"), so the bar has
+       to be wide enough to hold it. */
+    #my_jobs progress {
+        width: 98px;
+    }
+
+    #my_jobs .progress {
+        font-size: 12px;
     }
 
     .queue-note {

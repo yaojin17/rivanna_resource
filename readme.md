@@ -19,6 +19,45 @@ shows one account at a time rather than every account at once; the choice is rem
 across visits. The accounts on offer come from `LAB_ACCOUNTS` in `app.py`, or from the
 `RIVANNA_ACCOUNTS` environment variable as a comma separated list.
 
+### My Running Jobs (live)
+
+What each of your own running jobs is actually doing right now: cores busy against
+cores reserved, resident memory against memory reserved, and per GPU its utilisation,
+memory, power draw and temperature. CPU and RAM come from SLURM's accounting sampler
+(one `sstat` call covering every job at once); the GPU figures are read off the card by
+a short step launched inside each job with `srun --overlap`, which is also what scopes
+the reading to the GPUs that job was given rather than the whole node.
+
+**The GPU figures are averages, not snapshots.** A single `utilization.gpu` reading
+covers only 1/6--1s, and on a perfectly steady training job consecutive readings swing
+between 45% and 100%, because the metric asks "was a kernel running in that window" and
+the gaps around a dataloader step land inside it. So the probe (`gpu_probe.py`) goes to
+NVML's `nvmlDeviceGetSamples` instead, which hands back the samples the driver has
+*already* buffered -- utilisation averaged over the last ~5s, power over the last ~2.4s
+(the buffer's own depth), at no extra wall clock, since nothing has to be waited for.
+Across two refreshes the utilisation of a steady job now moves by about 2 points rather
+than 55. Memory and temperature stay point readings: they are levels, not rates. Hover
+any bar for the window and sample count behind it.
+
+If NVML cannot be reached the row falls back to a single `nvidia-smi` reading, marked
+`(instant)`; if the step cannot run at all it falls back to the GPU utilisation and
+memory SLURM sampled 30s apart, marked `(accounting)`.
+
+The CPU column is the load since the *previous* refresh, not the average over the run:
+`sstat` only reports CPU time used so far, so the live figure is the difference between
+two readings. The first refresh has nothing to subtract from and falls back to the run
+average, marked `avg`.
+
+"My" means the account running `app.py` -- SLURM will not report another user's job
+steps -- so the section names whose jobs it is showing. Because every refresh starts a
+step inside every GPU job, the panel is only fetched while its section is open, and
+"Update All" skips it when it was read in the last 15 seconds.
+
+![My Running Jobs](screenshots/my_jobs.png)
+
+*Trimmed to the first seven jobs; the real page lists all of them. Job ids, job
+names and the owner are replaced with placeholders in this screenshot.*
+
 ### Resource available
 
 Live GPU, CPU and memory occupancy for every node, grouped by GPU type and sorted by
@@ -69,6 +108,7 @@ showing an empty table.
 ![Allocations](screenshots/allocations.png)
 
 ## News
+- [09/17/2026]: Add a live per-job panel: CPU, RAM, GPU utilisation, GPU memory, power and temperature for your own running jobs, with the GPU figures averaged over a few seconds of the driver's own samples.
 - [09/10/2026]: Add the header account picker, and keep panels up when SLURM or the login node has a bad moment.
 - [09/03/2026]: Add estimated wait time, queue overview, per-pool priority, collapsible sections, and B200 / RTX PRO 6000 partitions.
 - [08/12/2025]: Add Multi-Instance GPU partition

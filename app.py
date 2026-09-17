@@ -18,6 +18,7 @@ import re
 from datetime import datetime, timedelta
 import argparse
 import functools
+import json
 import pwd
 import bisect
 import copy
@@ -25,7 +26,16 @@ import time
 import numpy as np
 import pytz
 from collections import defaultdict
-from subprocess import STDOUT, CalledProcessError, check_output
+from concurrent.futures import ThreadPoolExecutor
+from html import escape
+from subprocess import (
+    PIPE,
+    STDOUT,
+    CalledProcessError,
+    TimeoutExpired,
+    check_output,
+    run,
+)
 from flask import Flask, Response, render_template_string, request
 from slurm_gpustat import (
     resource_by_type,
@@ -2484,6 +2494,661 @@ def parse_allocations_to_table(account=None):
     return table_html
 
 
+# ---------------------------------------------------------------------------
+# "My running jobs": live CPU, memory and GPU readings for the jobs belonging
+# to whichever account started this app.  Only its own jobs can be read, since
+# both sstat and a --jobid step are refused for someone else's allocation.
+# ---------------------------------------------------------------------------
+
+MY_JOBS_FORMAT = (
+    ("jobid", 16),
+    ("name", 48),
+    ("partition", 32),
+    ("nodelist", 32),
+    ("timeused", 16),
+    ("timelimit", 16),
+    ("tres-alloc", 300),
+)
+# srun resolves the command against the submitting shell's PATH, which does not
+# reach the compute node's own binaries, so both of these are absolute paths.
+# The probe script sits next to this file, on the shared storage the compute
+# nodes mount, so the step can read it wherever it lands.
+NODE_PYTHON = "/usr/bin/python3"
+GPU_PROBE_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gpu_probe.py"
+)
+NVIDIA_SMI = "/usr/bin/nvidia-smi"
+NVIDIA_SMI_FIELDS = (
+    "index,name,utilization.gpu,memory.used,memory.total,"
+    "power.draw,power.limit,temperature.gpu"
+)
+# Each probe is a job step launched on a node that is already busy, and the
+# login node forks them under strict overcommit, so the fan-out stays modest.
+# Most of a probe is srun's step-launch latency rather than work, so eight of
+# them in flight roughly halves the panel against four; twelve buys nothing and
+# starts to jitter.  A fork that does fail is caught per job and falls back.
+GPU_PROBE_WORKERS = 8
+# How many seconds of the driver's buffered samples each average covers.  Passed
+# to gpu_probe.py, so this is the only place it is chosen.
+GPU_SAMPLE_WINDOW = 5.0
+GPU_PROBE_TIMEOUT = 15
+# jobid -> (cpu seconds, wall clock of that reading), so a refresh can report the
+# CPU load since the previous one rather than the average over the whole run.
+_CPU_SAMPLES = {}
+# Closer together than this, two readings say nothing useful: jobacct_gather
+# only samples the counters every 30s by default.
+CPU_SAMPLE_MIN_GAP = 20
+
+
+def _app_owner():
+    """Login name of the account running this app, whose jobs the panel shows."""
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def _slurm_time_to_seconds(text):
+    """'1-02:03:04', '02:03:04', '03:04.512' or '61' to seconds, None if unparsable."""
+    text = text.strip()
+    if not text or text in ("UNLIMITED", "INFINITE", "NONE", "N/A"):
+        return None
+    days = 0
+    if "-" in text:
+        day_str, text = text.split("-", 1)
+        if not day_str.isdigit():
+            print(f"Warning: unparsable SLURM duration {text!r}, ignoring it")
+            return None
+        days = int(day_str)
+    parts = text.split(":")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        print(f"Warning: unparsable SLURM duration {text!r}, ignoring it")
+        return None
+    if len(nums) == 3:
+        seconds = nums[0] * 3600 + nums[1] * 60 + nums[2]
+    elif len(nums) == 2:
+        seconds = nums[0] * 60 + nums[1]
+    elif len(nums) == 1:
+        seconds = nums[0]
+    else:
+        print(f"Warning: unparsable SLURM duration {text!r}, ignoring it")
+        return None
+    return days * 86400 + seconds
+
+
+def _alloc_gpu_count(tres):
+    """GPUs in a TRES string, counting the typed form (``gres/gpu:a40=1``) too."""
+    total = _tres_field(tres, "gres/gpu")
+    if total is not None and total.isdigit():
+        return int(total)
+    typed = re.findall(r"(?:^|,)gres/gpu:[^=,]+=(\d+)", tres)
+    return sum(int(n) for n in typed)
+
+
+def _my_running_jobs():
+    """One dict per running job of this account, in squeue's own order."""
+    owner = _app_owner()
+    fmt = ",".join(f"{name}:{width}" for name, width in MY_JOBS_FORMAT)
+    rows = parse_cmd(f"squeue -a -h -u {owner} -t RUNNING -O '{fmt}'")
+    jobs = []
+    for row in rows:
+        entry = {}
+        pos = 0
+        for name, width in MY_JOBS_FORMAT:
+            entry[name] = row[pos : pos + width].strip()
+            pos += width
+        if not entry["jobid"]:
+            print(f"Warning: squeue row without a job id {row[:80]!r}, skipping")
+            continue
+        jobs.append(entry)
+    return jobs
+
+
+def _sstat_usage(jobids):
+    """Live counters from sstat for each job id, folded across its steps.
+
+    sstat prints one line per step, so CPU time and resident memory are added up
+    across the steps that run at once, while the GPU counters are taken at their
+    highest: only the step holding the GPU reports anything for it, and the
+    ``.batch`` shell that wraps it reports zeros.  A job with no GPU carries no
+    ``gres/`` fields at all, and one whose steps have not registered yet is
+    simply missing from the result.
+    """
+    usage = {}
+    if not jobids:
+        return usage
+    rows = parse_cmd(
+        f"sstat -a -n -P -j {','.join(jobids)} "
+        "--format=JobID,TRESUsageInAve,TRESUsageInMax"
+    )
+    for row in rows:
+        fields = row.split("|")
+        if len(fields) < 3:
+            print(f"Warning: unexpected sstat row {row[:80]!r}, skipping")
+            continue
+        step, ave, peak = fields[0], fields[1], fields[2]
+        jobid = step.split(".", 1)[0]
+        entry = usage.setdefault(
+            jobid,
+            {"cpu_seconds": 0.0, "mem_mb": 0, "peak_mem_mb": 0,
+             "gpu_util": None, "gpu_mem_mb": None},
+        )
+
+        cpu = _slurm_time_to_seconds(_tres_field(ave, "cpu") or "")
+        if cpu is not None:
+            entry["cpu_seconds"] += cpu
+        for key, tres in (("mem_mb", ave), ("peak_mem_mb", peak)):
+            mem = _tres_field(tres, "mem")
+            if mem is None:
+                continue
+            mem_mb = _mem_to_mb(mem)
+            if mem_mb is None:
+                print(f"Warning: unparsable memory {mem!r} for step {step}, ignoring it")
+                continue
+            entry[key] += mem_mb
+
+        util = _tres_field(ave, "gres/gpuutil")
+        if util is not None:
+            if util.isdigit():
+                entry["gpu_util"] = max(entry["gpu_util"] or 0, int(util))
+            else:
+                print(f"Warning: unparsable gres/gpuutil {util!r} for step {step}, ignoring it")
+        gpu_mem = _tres_field(ave, "gres/gpumem")
+        if gpu_mem is not None:
+            gpu_mem_mb = _mem_to_mb(gpu_mem)
+            if gpu_mem_mb is None:
+                print(f"Warning: unparsable gres/gpumem {gpu_mem!r} for step {step}, ignoring it")
+            else:
+                entry["gpu_mem_mb"] = max(entry["gpu_mem_mb"] or 0, gpu_mem_mb)
+    return usage
+
+
+def _smi_number(text, jobid, field):
+    """A number out of nvidia-smi, or None for the ``[N/A]`` it prints instead.
+
+    Not every board reports every field -- a MIG slice has no power reading of
+    its own, for one -- and nvidia-smi marks those with a bracketed word rather
+    than leaving the column out, so those are expected and stay quiet.
+    """
+    try:
+        return float(text)
+    except ValueError:
+        if not text.startswith("["):
+            print(f"Warning: unreadable nvidia-smi {field}={text!r} for job {jobid}")
+        return None
+
+
+def _run_in_job(jobid, argv):
+    """Run one short command inside a running job of ours, as a job step.
+
+    The step runs alongside the job's own work (``--overlap``) and asks for no
+    memory of its own, so it starts at once instead of queueing behind a job
+    that already holds every byte it was given.  It does keep the job's GRES,
+    which is what limits the reading to the GPUs this job was handed rather
+    than every GPU on the node.  ``--immediate`` turns a step that cannot start
+    into a quick failure instead of a refresh that hangs.
+
+    This is deliberately not routed through parse_cmd: its retries would launch
+    three steps for a job that has just ended, and it has no timeout.
+
+    Returns the decoded stdout, or None after warning about why it could not.
+    """
+    cmd = [
+        "srun", "-Q", "--immediate=5", f"--jobid={jobid}", "--overlap",
+        "-n1", "-c1", "--mem-per-cpu=0",
+    ] + list(argv)
+    what = os.path.basename(argv[0])
+    try:
+        completed = run(cmd, stdout=PIPE, stderr=PIPE, timeout=GPU_PROBE_TIMEOUT)
+    except TimeoutExpired:
+        print(f"Warning: {what} probe of job {jobid} timed out after {GPU_PROBE_TIMEOUT}s")
+        return None
+    except OSError as exc:
+        print(f"Warning: could not start the {what} probe of job {jobid}: {exc}")
+        return None
+
+    reason = " ".join(completed.stderr.decode("utf-8", "replace").split())
+    if completed.returncode != 0:
+        print(
+            f"Warning: {what} probe of job {jobid} failed "
+            f"(exit {completed.returncode}: {reason or 'no stderr'})"
+        )
+        return None
+    if reason:
+        # The probe warns about a reading it could not take but still prints the
+        # rest, so this is worth logging without throwing the row away.
+        print(f"Warning: {what} probe of job {jobid} reported: {reason}")
+    return completed.stdout.decode("utf-8", "replace")
+
+
+def _probe_gpu_nvml(jobid):
+    """Read the job's GPUs through NVML, averages included; None if it failed.
+
+    gpu_probe.py pulls utilisation and power out of the ring buffer the driver
+    fills on its own, so a multi-second average costs no more wall clock than a
+    single reading would.
+    """
+    output = _run_in_job(
+        jobid, [NODE_PYTHON, GPU_PROBE_SCRIPT, str(GPU_SAMPLE_WINDOW)]
+    )
+    if output is None:
+        return None
+
+    gpus = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            card = json.loads(line)
+        except ValueError as exc:
+            print(f"Warning: unreadable gpu_probe line {line[:80]!r} for job {jobid}: {exc}")
+            continue
+        gpus.append(
+            {
+                "index": card["index"],
+                "name": re.sub(r"^NVIDIA\s+", "", card["name"] or "GPU"),
+                "util": card["util_avg"],
+                "util_window_s": card["util_window_s"],
+                "util_n": card["util_n"],
+                "mem_used_mb": card["mem_used_mb"],
+                "mem_total_mb": card["mem_total_mb"],
+                "power": card["power_avg_w"],
+                "power_window_s": card["power_window_s"],
+                "power_n": card["power_n"],
+                "power_limit": card["power_limit_w"],
+                "temp": card["temp_c"],
+                "source": "nvml",
+            }
+        )
+    if not gpus:
+        print(f"Warning: gpu_probe of job {jobid} returned no GPU, ignoring it")
+        return None
+    return gpus
+
+
+def _probe_gpu_smi(jobid):
+    """Fall back to nvidia-smi, whose readings are a single instant, not a mean.
+
+    Kept for a node where NVML cannot be reached the way gpu_probe.py does it;
+    the rows it produces are marked so the page does not claim an average it
+    never took.
+    """
+    output = _run_in_job(
+        jobid,
+        [NVIDIA_SMI, f"--query-gpu={NVIDIA_SMI_FIELDS}", "--format=csv,noheader,nounits"],
+    )
+    if output is None:
+        return None
+
+    gpus = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 8:
+            print(f"Warning: unexpected nvidia-smi row {line!r} for job {jobid}, skipping")
+            continue
+        index, name, util, mem_used, mem_total, power, power_limit, temp = parts
+        gpus.append(
+            {
+                "index": index,
+                "name": re.sub(r"^NVIDIA\s+", "", name),
+                "util": _smi_number(util, jobid, "utilization.gpu"),
+                "util_window_s": None,
+                "util_n": None,
+                "mem_used_mb": _smi_number(mem_used, jobid, "memory.used"),
+                "mem_total_mb": _smi_number(mem_total, jobid, "memory.total"),
+                "power": _smi_number(power, jobid, "power.draw"),
+                "power_window_s": None,
+                "power_n": None,
+                "power_limit": _smi_number(power_limit, jobid, "power.limit"),
+                "temp": _smi_number(temp, jobid, "temperature.gpu"),
+                "source": "nvidia-smi",
+            }
+        )
+    if not gpus:
+        print(f"Warning: nvidia-smi probe of job {jobid} returned no GPU, ignoring it")
+        return None
+    return gpus
+
+
+def _probe_gpu(jobid):
+    """One job's GPUs, preferring the averaged NVML reading over a point one."""
+    return _probe_gpu_nvml(jobid) or _probe_gpu_smi(jobid)
+
+
+def _probe_gpus(jobids):
+    """Probe several jobs at once, keyed by job id; jobs that failed are absent."""
+    if not jobids:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(GPU_PROBE_WORKERS, len(jobids))) as pool:
+        probed = list(pool.map(_probe_gpu, jobids))
+    return {jobid: gpus for jobid, gpus in zip(jobids, probed) if gpus}
+
+
+def _cpu_rate(jobid, cpu_seconds, elapsed_seconds, now):
+    """Cores busy in this job as ``(cores, is_recent)``.
+
+    sstat only reports the CPU time burnt so far, so the live figure is the
+    difference between two refreshes divided by the time between them.  The
+    first refresh after the app starts has nothing to subtract from and falls
+    back to the average over the whole run, which is flagged by ``is_recent``.
+    """
+    previous = _CPU_SAMPLES.get(jobid)
+    average = cpu_seconds / elapsed_seconds if elapsed_seconds else None
+
+    if previous is None:
+        _CPU_SAMPLES[jobid] = (cpu_seconds, now)
+        return average, False
+
+    prev_cpu, prev_at = previous
+    gap = now - prev_at
+    if gap < CPU_SAMPLE_MIN_GAP:
+        # Two refreshes in quick succession land inside one accounting sample.
+        # Keep the older reading so the next refresh still has a real baseline.
+        return average, False
+
+    _CPU_SAMPLES[jobid] = (cpu_seconds, now)
+    if cpu_seconds < prev_cpu:
+        print(
+            f"Warning: CPU time of job {jobid} went backwards "
+            f"({prev_cpu:.0f}s -> {cpu_seconds:.0f}s), showing the run average"
+        )
+        return average, False
+    return (cpu_seconds - prev_cpu) / gap, True
+
+
+def _short_duration(seconds):
+    """Seconds to ``3d04h`` / ``4h12m`` / ``7m``, for the elapsed/limit column."""
+    if seconds is None:
+        return "&infin;"
+    minutes = int(seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d{hours:02d}h"
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _gb(megabytes):
+    """Megabytes as a short GB string, keeping a decimal below 10 GB."""
+    gigabytes = megabytes / 1024
+    return f"{gigabytes:.1f}" if gigabytes < 10 else f"{gigabytes:.0f}"
+
+
+def _tres_count(text):
+    """A plain integer TRES count, or None when the field was missing."""
+    if text is None or not text.isdigit():
+        return None
+    return int(text)
+
+
+def _accounting_gpu_row(counters):
+    """One GPU row rebuilt from sstat, for when both probes failed.
+
+    SLURM samples the job's counters every JobAcctGatherFrequency seconds (30 on
+    Rivanna) and keeps no power or temperature at all, so this row is both
+    coarser and thinner than a probed one, and says so.
+    """
+    if counters is None:
+        return None
+    if counters["gpu_util"] is None and counters["gpu_mem_mb"] is None:
+        return None
+    return [
+        {
+            "index": None,
+            "name": None,
+            "util": counters["gpu_util"],
+            "util_window_s": ACCOUNTING_SAMPLE_SECONDS,
+            "util_n": None,
+            "mem_used_mb": counters["gpu_mem_mb"],
+            "mem_total_mb": None,
+            "power": None,
+            "power_window_s": None,
+            "power_n": None,
+            "power_limit": None,
+            "temp": None,
+            "source": "accounting",
+        }
+    ]
+
+
+def _cpu_cell(cores, recent, alloc_cpus, span):
+    """CPU column: cores busy right now against the cores the job was given."""
+    if cores is None:
+        return f'<td{span}><span class="queue-muted">n/a</span></td>'
+    mark = "" if recent else '<span class="cpu-average">avg</span> '
+    if not alloc_cpus:
+        return f"<td{span}>{mark}{cores:.1f} cores</td>"
+    text = f"{cores:.1f}/{alloc_cpus}"
+    bar = get_resource_bar(min(cores, alloc_cpus), alloc_cpus, text)
+    return f"<td{span}>{mark}{bar}</td>"
+
+
+def _ram_cell(counters, alloc_mem_mb, span):
+    """RAM column: resident memory now, against what the job reserved."""
+    used = counters["mem_mb"]
+    peak = counters["peak_mem_mb"]
+    title = f' title="peak so far {_gb(peak)} GB"' if peak else ""
+    if not alloc_mem_mb:
+        return f"<td{span}{title}>{_gb(used)} GB</td>"
+    text = f"{_gb(used)}/{_gb(alloc_mem_mb)}G"
+    bar = get_resource_bar(min(used, alloc_mem_mb), alloc_mem_mb, text)
+    return f"<td{span}{title}>{bar}</td>"
+
+
+DASH = '<td class="dimmed">&mdash;</td>'
+# What SLURM's own sampler manages, for the row that has nothing better.
+ACCOUNTING_SAMPLE_SECONDS = 30
+
+
+def _window_title(gpu, field):
+    """Tooltip spelling out what window a reading actually averages over.
+
+    The driver buffers roughly 14s of utilisation samples but only ~2.4s of
+    power samples, so asking for five seconds gets five of the one and less of
+    the other; the number shown is the span the samples really covered.
+    """
+    window = gpu[f"{field}_window_s"]
+    if gpu["source"] == "nvidia-smi":
+        return ' title="single reading, not an average: nvidia-smi fallback"'
+    if gpu["source"] == "accounting":
+        return f' title="from SLURM accounting, sampled every {ACCOUNTING_SAMPLE_SECONDS}s"'
+    if not window:
+        return ' title="no samples buffered for this window"'
+    count = gpu[f"{field}_n"]
+    thin = ", only 1 sample" if count == 1 else ""
+    return f' title="mean of {count} samples over the last {window:.1f}s{thin}"'
+
+
+def _gpu_cells(gpu, show_index):
+    """The five GPU columns of one row, dashed out for a job without a GPU.
+
+    Under cgroup isolation a one-GPU job always sees its card as index 0, so the
+    index is only worth printing when the job holds more than one.
+    """
+    if gpu is None:
+        return [DASH] * 5
+
+    if gpu["name"]:
+        prefix = f'{gpu["index"]}: ' if show_index else ""
+        cells = [f'<td>{prefix}{escape(gpu["name"])}</td>']
+    else:
+        cells = ['<td><span class="queue-muted">(accounting)</span></td>']
+    if gpu["source"] == "nvidia-smi":
+        cells[0] = cells[0].replace(
+            "</td>", ' <span class="queue-muted">(instant)</span></td>'
+        )
+
+    if gpu["util"] is None:
+        cells.append(DASH)
+    else:
+        bar = get_resource_bar(gpu["util"], 100, f'{gpu["util"]:.0f}%')
+        cells.append(f'<td{_window_title(gpu, "util")}>{bar}</td>')
+
+    used, total = gpu["mem_used_mb"], gpu["mem_total_mb"]
+    if used is None:
+        cells.append(DASH)
+    elif total:
+        bar = get_resource_bar(used, total, f"{_gb(used)}/{_gb(total)}G")
+        cells.append(f"<td>{bar}</td>")
+    else:
+        cells.append(f"<td>{_gb(used)} GB</td>")
+
+    draw, limit = gpu["power"], gpu["power_limit"]
+    title = _window_title(gpu, "power")
+    if draw is None:
+        cells.append(DASH)
+    elif limit:
+        bar = get_resource_bar(min(draw, limit), limit, f"{draw:.0f}/{limit:.0f}W")
+        cells.append(f"<td{title}>{bar}</td>")
+    else:
+        cells.append(f"<td{title}>{draw:.0f} W</td>")
+
+    if gpu["temp"] is None:
+        cells.append(DASH)
+    else:
+        cells.append(f'<td class="{_temp_css(gpu["temp"])}">{gpu["temp"]:.0f} &deg;C</td>')
+    return cells
+
+
+def _temp_css(celsius):
+    """Colour a GPU temperature: A40/A6000 boards throttle in the high eighties."""
+    if celsius >= 85:
+        return "queue-pressure-high"
+    if celsius >= 75:
+        return "queue-pressure-mid"
+    return "queue-pressure-low"
+
+
+def parse_my_jobs_to_table():
+    """Live CPU, RAM and GPU readings for the running jobs of this account.
+
+    Two sources are combined per refresh.  One sstat call covers every job at
+    once and gives the CPU time and resident memory the accounting plugin last
+    sampled; then one short nvidia-smi step per GPU job gives the readings SLURM
+    does not keep, above all the power draw and the board temperature.  A job
+    whose probe fails still shows the GPU utilisation and memory that sstat
+    collected, marked as coming from accounting rather than from the card.
+    """
+    owner = _app_owner()
+    jobs = _my_running_jobs()
+    if not jobs:
+        return (
+            f'<p class="queue-note">{escape(display_name(owner))} has no running '
+            "job right now.</p>"
+        )
+
+    jobids = [job["jobid"] for job in jobs]
+    usage = _sstat_usage(jobids)
+    gpu_jobs = [job["jobid"] for job in jobs if _alloc_gpu_count(job["tres-alloc"])]
+    probes = _probe_gpus(gpu_jobs)
+
+    # Jobs that have ended since the last refresh must not keep a sample around,
+    # or a recycled job id would be handed someone else's counter.
+    for stale in set(_CPU_SAMPLES) - set(jobids):
+        del _CPU_SAMPLES[stale]
+
+    now = time.time()
+    columns = ("JOB", "PARTITION", "NODE", "ELAPSED", "CPU", "RAM",
+               "GPU", "UTIL", "GPU MEM", "POWER", "TEMP")
+    html = ["<table>", "<tr>"]
+    html += [f"<th>{column}</th>" for column in columns]
+    html.append("</tr>")
+
+    stale_cpu = False
+    accounting_only = False
+    instant_only = False
+    for job in jobs:
+        jobid = job["jobid"]
+        tres = job["tres-alloc"]
+        counters = usage.get(jobid)
+        alloc_cpus = _tres_count(_tres_field(tres, "cpu"))
+        alloc_mem_mb = _mem_to_mb(_tres_field(tres, "mem") or "")
+        elapsed = _slurm_time_to_seconds(job["timeused"])
+        limit = _slurm_time_to_seconds(job["timelimit"])
+
+        # One row per GPU, so a multi-GPU job shows each card on its own line.
+        gpus = probes.get(jobid)
+        if gpus is None:
+            gpus = _accounting_gpu_row(counters)
+            accounting_only = accounting_only or bool(gpus)
+        elif any(gpu["source"] == "nvidia-smi" for gpu in gpus):
+            instant_only = True
+        rows = gpus or [None]
+        span = f' rowspan="{len(rows)}"' if len(rows) > 1 else ""
+
+        for position, gpu in enumerate(rows):
+            html.append("<tr>")
+            if position == 0:
+                html.append(
+                    f'<td{span}>{jobid}<br><span class="job-name">'
+                    f'{escape(job["name"])}</span></td>'
+                )
+                html.append(f'<td{span}>{escape(job["partition"])}</td>')
+                html.append(f'<td{span}>{escape(job["nodelist"])}</td>')
+                html.append(
+                    f"<td{span}>{_short_duration(elapsed)}"
+                    f'<span class="queue-muted"> / {_short_duration(limit)}</span></td>'
+                )
+
+                if counters is None:
+                    # Between the job starting and its first step registering,
+                    # sstat has nothing to report for it yet.
+                    pending = '<td{0}><span class="queue-muted">starting…</span></td>'
+                    html.append(pending.format(span))
+                    html.append(pending.format(span))
+                else:
+                    cores, recent = _cpu_rate(
+                        jobid, counters["cpu_seconds"], elapsed, now
+                    )
+                    stale_cpu = stale_cpu or not recent
+                    html.append(_cpu_cell(cores, recent, alloc_cpus, span))
+                    html.append(_ram_cell(counters, alloc_mem_mb, span))
+
+            html += _gpu_cells(gpu, len(rows) > 1)
+            html.append("</tr>")
+
+    html.append("</table>")
+
+    notes = [
+        f"Readings for <b>{escape(display_name(owner))}</b>, taken when this "
+        "section was last refreshed. CPU and RAM come from SLURM's accounting "
+        "sampler; the GPU columns are read off the card by a short step inside "
+        "each job."
+    ]
+    notes.append(
+        f"<b>UTIL</b> is the mean over the last ~{GPU_SAMPLE_WINDOW:.0f}s and "
+        "<b>POWER</b> over the last ~2.4s, taken from samples the driver has "
+        "already buffered, so averaging them costs no extra wait. A single "
+        "instant of utilisation swings tens of points on a steady job, which is "
+        "why it is not shown raw. <b>GPU MEM</b> and <b>TEMP</b> are point "
+        "readings, being levels rather than rates. Hover a bar for the window "
+        "and sample count behind it."
+    )
+    if stale_cpu:
+        notes.append(
+            "A CPU figure marked <span class=\"cpu-average\">avg</span> is the "
+            "average over the whole run: the live number needs two refreshes "
+            f"at least {CPU_SAMPLE_MIN_GAP}s apart to subtract."
+        )
+    if instant_only:
+        notes.append(
+            "A GPU row marked <span class=\"queue-muted\">(instant)</span> fell "
+            "back to <code>nvidia-smi</code>, which reports one moment rather "
+            "than an average, so its utilisation is the noisy figure."
+        )
+    if accounting_only:
+        notes.append(
+            "A GPU row marked <span class=\"queue-muted\">(accounting)</span> "
+            "could not be read on the card at all, so it falls back to what "
+            f"SLURM sampled every {ACCOUNTING_SAMPLE_SECONDS}s; power and "
+            "temperature are not collected there."
+        )
+    html += [f'<p class="queue-note">{note}</p>' for note in notes]
+    return "".join(html)
+
 def slurm_response(build, *args, **kwargs):
     """Render one panel, degrading to a note when the query cannot be made.
 
@@ -2528,6 +3193,7 @@ def main():
             open("index.html").read(),
             hostname=args.host,
             accounts=LAB_ACCOUNTS,
+            my_jobs_min_gap_ms=CPU_SAMPLE_MIN_GAP * 1000,
         )
 
     @app.route("/time_feed")
@@ -2582,6 +3248,10 @@ def main():
     @app.route("/allocations")
     def allocations():
         return slurm_response(parse_allocations_to_table, selected_account(request.args))
+
+    @app.route("/my_jobs")
+    def my_jobs():
+        return slurm_response(parse_my_jobs_to_table)
 
     # @app.route('/cpu_resource')
     # def cpu_resource():
