@@ -2504,7 +2504,6 @@ MY_JOBS_FORMAT = (
     ("jobid", 16),
     ("name", 48),
     ("partition", 32),
-    ("nodelist", 32),
     ("timeused", 16),
     ("timelimit", 16),
     ("tres-alloc", 300),
@@ -3051,7 +3050,7 @@ def parse_my_jobs_to_table():
         del _CPU_SAMPLES[stale]
 
     now = time.time()
-    columns = ("JOB", "PARTITION", "NODE", "ELAPSED", "CPU", "RAM",
+    columns = ("JOB", "PARTITION", "ELAPSED", "CPU", "RAM",
                "GPU", "UTIL", "GPU MEM", "POWER", "TEMP")
     html = ["<table>", "<tr>"]
     html += [f"<th>{column}</th>" for column in columns]
@@ -3087,7 +3086,6 @@ def parse_my_jobs_to_table():
                     f'{escape(job["name"])}</span></td>'
                 )
                 html.append(f'<td{span}>{escape(job["partition"])}</td>')
-                html.append(f'<td{span}>{escape(job["nodelist"])}</td>')
                 html.append(
                     f"<td{span}>{_short_duration(elapsed)}"
                     f'<span class="queue-muted"> / {_short_duration(limit)}</span></td>'
