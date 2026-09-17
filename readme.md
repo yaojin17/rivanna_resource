@@ -21,42 +21,25 @@ across visits. The accounts on offer come from `LAB_ACCOUNTS` in `app.py`, or fr
 
 ### My Running Jobs (live)
 
-What each of your own running jobs is actually doing right now: cores busy against
-cores reserved, resident memory against memory reserved, and per GPU its utilisation,
-memory, power draw and temperature. CPU and RAM come from SLURM's accounting sampler
-(one `sstat` call covering every job at once); the GPU figures are read off the card by
-a short step launched inside each job with `srun --overlap`, which is also what scopes
-the reading to the GPUs that job was given rather than the whole node.
+What your own running jobs are actually doing: cores busy against cores reserved,
+resident memory against memory reserved, and per GPU its utilisation, memory, power
+draw and temperature. CPU and RAM come from one `sstat` call; the GPU figures are read
+on the card by a short step inside each job (`srun --overlap`), which is also what
+limits the reading to the GPUs that job holds.
 
-**The GPU figures are averages, not snapshots.** A single `utilization.gpu` reading
-covers only 1/6--1s, and on a perfectly steady training job consecutive readings swing
-between 45% and 100%, because the metric asks "was a kernel running in that window" and
-the gaps around a dataloader step land inside it. So the probe (`gpu_probe.py`) goes to
-NVML's `nvmlDeviceGetSamples` instead, which hands back the samples the driver has
-*already* buffered -- utilisation averaged over the last ~5s, power over the last ~2.4s
-(the buffer's own depth), at no extra wall clock, since nothing has to be waited for.
-Across two refreshes the utilisation of a steady job now moves by about 2 points rather
-than 55. Memory and temperature stay point readings: they are levels, not rates. Hover
-any bar for the window and sample count behind it.
+The GPU figures are averages, not snapshots: one `utilization.gpu` reading covers
+1/6--1s and swings between 45% and 100% on a steady job, so `gpu_probe.py` asks NVML for
+the samples the driver has *already* buffered -- ~5s of utilisation, ~2.4s of power, at
+no extra wait. Memory and temperature stay point readings. Hover any bar for its window
+and sample count.
 
-If NVML cannot be reached the row falls back to a single `nvidia-smi` reading, marked
-`(instant)`; if the step cannot run at all it falls back to the GPU utilisation and
-memory SLURM sampled 30s apart, marked `(accounting)`.
-
-The CPU column is the load since the *previous* refresh, not the average over the run:
-`sstat` only reports CPU time used so far, so the live figure is the difference between
-two readings. The first refresh has nothing to subtract from and falls back to the run
-average, marked `avg`.
-
-"My" means the account running `app.py` -- SLURM will not report another user's job
-steps -- so the section names whose jobs it is showing. Because every refresh starts a
-step inside every GPU job, the panel is only fetched while its section is open, and
-"Update All" skips it when it was read in the last 15 seconds.
+"My" means the account running `app.py`; SLURM will not report another user's job steps.
+Each refresh starts a step inside every GPU job, so the panel is fetched only while its
+section is open.
 
 ![My Running Jobs](screenshots/my_jobs.png)
 
-*Trimmed to the first seven jobs; the real page lists all of them. Job ids, job
-names and the owner are replaced with placeholders in this screenshot.*
+*Trimmed to the first seven jobs; ids, job names and the owner are placeholders.*
 
 ### Resource available
 
