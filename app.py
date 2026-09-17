@@ -154,6 +154,31 @@ def display_name(user):
     return f"{name} ({user})"
 
 
+def _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner):
+    """One leaderboard line; the row of the account running this app is marked."""
+    total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
+    user_summary = [
+        f"{key}={val}"
+        for key, val in sorted(
+            subdict["n_gpu"].items(),
+            key=lambda x: CAPABILITY.get(x[0], 10.0),
+            reverse=True,
+        )
+    ]
+    summary_str = "".join([f"{i:<16s}" for i in user_summary])
+    num_new_gpus = [
+        val for key, val in subdict["n_gpu"].items() if key not in OLD_GPU_TYPES
+    ]
+    for gm in sum_by_gmem:
+        total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
+    total += f"|newer={str(sum(num_new_gpus)):2s}"
+    total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
+    line = escape(f"{display_name(user):{name_width}s}[{total}]    {summary_str}")
+    if user == owner:
+        return f'<span class="leaderboard-me">&gt; {line}</span>\n'
+    return f"  {line}\n"
+
+
 def parse_leaderboard(sum_by_gmem=[48]):
     """Request sinfo, parse the leaderboard in string."""
 
@@ -172,28 +197,12 @@ def parse_leaderboard(sum_by_gmem=[48]):
             for key, val in subdict.items()
         }
     out = ""
+    owner = _app_owner()
     name_width = max((len(display_name(u)) for u in aggregates), default=12) + 2
     for user, subdict in sorted(
         aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
     ):
-        total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
-        user_summary = [
-            f"{key}={val}"
-            for key, val in sorted(
-                subdict["n_gpu"].items(),
-                key=lambda x: CAPABILITY.get(x[0], 10.0),
-                reverse=True,
-            )
-        ]
-        summary_str = "".join([f"{i:<16s}" for i in user_summary])
-        num_new_gpus = [
-            val for key, val in subdict["n_gpu"].items() if key not in OLD_GPU_TYPES
-        ]
-        for gm in sum_by_gmem:
-            total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
-        total += f"|newer={str(sum(num_new_gpus)):2s}"
-        total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
-        out += f"{display_name(user):{name_width}s}[{total}]    {summary_str}\n"
+        out += _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner)
     return out
 
 
@@ -202,6 +211,7 @@ def parse_leaderboard_by_partition(sum_by_gmem=[48]):
     resources = parse_all_gpus()
     gpu_partitions = get_gpu_partitions()
 
+    owner = _app_owner()
     out = "=" * 64 + "\n"
     for i, part in enumerate(gpu_partitions):
         usage = gpu_usage(resources=resources, partition=part)  # partition='gpu'
@@ -223,24 +233,7 @@ def parse_leaderboard_by_partition(sum_by_gmem=[48]):
         for user, subdict in sorted(
             aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
         ):
-            total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
-            user_summary = [
-                f"{key}={val}"
-                for key, val in sorted(
-                    subdict["n_gpu"].items(),
-                    key=lambda x: CAPABILITY.get(x[0], 10.0),
-                    reverse=True,
-                )
-            ]
-            summary_str = "".join([f"{i:<16s}" for i in user_summary])
-            num_new_gpus = [
-                val for key, val in subdict["n_gpu"].items() if key not in OLD_GPU_TYPES
-            ]
-            for gm in sum_by_gmem:
-                total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
-            total += f"|newer={str(sum(num_new_gpus)):2s}"
-            total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
-            out += f"{display_name(user):{name_width}s}[{total}]    {summary_str}\n"
+            out += _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner)
     out += "=" * 64 + "\n"
     return out
 
