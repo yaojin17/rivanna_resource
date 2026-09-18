@@ -160,6 +160,13 @@
 
 <!-- Update content every {interval} ms -->
 <script>
+    // Every endpoint is fetched relative to this page rather than from the site
+    // root. Served directly the two are the same, but behind OnDemand's
+    // /rnode/<host>/<port>/ proxy they are not, and that proxy does not rewrite
+    // links: a fetch of "/resource" would leave the app entirely and 404. The
+    // index page is always the app root, so its own path is the prefix.
+    var BASE = location.pathname.replace(/\/?$/, "/");
+
     // Remove all setInterval calls and change to manual update
     var clock = document.getElementById("clock");
     var disk_quota = document.getElementById("disk_quota");
@@ -269,7 +276,7 @@
         jobButton.textContent = "Calculating...";
         try {
             params.set("account", currentAccount());
-            var response = await fetch("{{ url_for('wait_estimate') }}?" + params.toString());
+            var response = await fetch(BASE + "{{ url_for('wait_estimate')[1:] }}?" + params.toString());
             wait_estimate.innerHTML = await response.text();
         } catch (err) {
             wait_estimate.innerHTML = "<p>Failed to fetch wait estimates: " + err + "</p>";
@@ -295,7 +302,7 @@
         myJobsFetchedAt = Date.now();
         my_jobs.innerHTML = "<p>Reading the cards...</p>";
         try {
-            var response = await fetch("{{ url_for('my_jobs') }}");
+            var response = await fetch(BASE + "{{ url_for('my_jobs')[1:] }}");
             my_jobs.innerHTML = await response.text();
         } catch (err) {
             my_jobs.innerHTML = "<p>Failed to read my running jobs: " + err + "</p>";
@@ -337,14 +344,14 @@
         updateButton.textContent = "Updating...";
 
         var tasks = [
-            panelTask("the clock", clock, "{{ url_for('time_feed') }}"),
-            panelTask("resource info", resource, "{{ url_for('resource') }}"),
-            panelTask("queue stats", queue_stats, "{{ url_for('queue_stats') }}"),
-            panelTask("priority ranking", priority, "{{ url_for('priority') }}?" + accountParam()),
-            panelTask("queue info", queue, "{{ url_for('queue') }}?" + accountParam()),
-            panelTask("the leaderboard", leaderboard, "{{ url_for('leaderboard') }}"),
-            panelTask("allocations", allocations, "{{ url_for('allocations') }}?" + accountParam()),
-            panelTask("disk quota", disk_quota, "{{ url_for('disk_quota') }}"),
+            panelTask("the clock", clock, BASE + "{{ url_for('time_feed')[1:] }}"),
+            panelTask("resource info", resource, BASE + "{{ url_for('resource')[1:] }}"),
+            panelTask("queue stats", queue_stats, BASE + "{{ url_for('queue_stats')[1:] }}"),
+            panelTask("priority ranking", priority, BASE + "{{ url_for('priority')[1:] }}?" + accountParam()),
+            panelTask("queue info", queue, BASE + "{{ url_for('queue')[1:] }}?" + accountParam()),
+            panelTask("the leaderboard", leaderboard, BASE + "{{ url_for('leaderboard')[1:] }}"),
+            panelTask("allocations", allocations, BASE + "{{ url_for('allocations')[1:] }}?" + accountParam()),
+            panelTask("disk quota", disk_quota, BASE + "{{ url_for('disk_quota')[1:] }}"),
             // These two write their own error message, so they need no wrapper.
             updateWaitEstimate,
         ];
