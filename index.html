@@ -310,83 +310,71 @@
         if (myJobsSection.open) updateMyJobs();
     });
 
+    // Every panel is an independent query, so they all go out at once: the page
+    // now takes as long as its slowest panel rather than the sum of them all.
+    // A panel that fails says so in its own box and the other panels still land.
+    function panelTask(label, target, url) {
+        return function () {
+            return fetch(url)
+                .then(function (response) { return response.text(); })
+                .then(function (t) { target.innerHTML = t; })
+                .catch(function (err) {
+                    console.error("Failed to update " + label + ":", err);
+                    target.innerHTML = "<p>Failed to update " + label + ": " + err + "</p>";
+                    throw err;
+                });
+        };
+    }
+
+    // Tabbing back to the page calls updateAll, so without this a refresh that
+    // is still running would fire a second full burst on top of the first.
+    var updateInFlight = false;
+
     async function updateAll() {
-        // Disable update button
+        if (updateInFlight) return;
+        updateInFlight = true;
         updateButton.disabled = true;
         updateButton.textContent = "Updating...";
-        updateStatus.textContent = "Starting update...";
-        
+
+        var tasks = [
+            panelTask("the clock", clock, "{{ url_for('time_feed') }}"),
+            panelTask("resource info", resource, "{{ url_for('resource') }}"),
+            panelTask("queue stats", queue_stats, "{{ url_for('queue_stats') }}"),
+            panelTask("priority ranking", priority, "{{ url_for('priority') }}?" + accountParam()),
+            panelTask("queue info", queue, "{{ url_for('queue') }}?" + accountParam()),
+            panelTask("the leaderboard", leaderboard, "{{ url_for('leaderboard') }}"),
+            panelTask("allocations", allocations, "{{ url_for('allocations') }}?" + accountParam()),
+            panelTask("disk quota", disk_quota, "{{ url_for('disk_quota') }}"),
+            // These two write their own error message, so they need no wrapper.
+            updateWaitEstimate,
+        ];
+        if (myJobsSection.open && Date.now() - myJobsFetchedAt > MY_JOBS_MIN_GAP_MS) {
+            tasks.push(updateMyJobs);
+        }
+
+        var done = 0;
+        var total = tasks.length;
+        updateStatus.textContent = "Updating... 0/" + total;
+
         try {
-            // Update time
-            updateStatus.textContent = "Updating time...";
-            await fetch("{{ url_for('time_feed') }}")
-                .then(response => response.text())
-                .then(t => {clock.innerHTML = t;});
+            var results = await Promise.allSettled(tasks.map(function (task) {
+                return task().finally(function () {
+                    done += 1;
+                    updateStatus.textContent = "Updating... " + done + "/" + total;
+                });
+            }));
+            var failed = results.filter(function (r) { return r.status === "rejected"; }).length;
+            updateStatus.textContent = failed
+                ? "Updated, " + failed + " of " + total + " panels failed"
+                : "Update completed!";
 
-            // Update resource information
-            updateStatus.textContent = "Updating resource info...";
-            await fetch("{{ url_for('resource') }}")
-                .then(response => response.text())
-                .then(t => {resource.innerHTML = t;});
-
-            // Update queue stats
-            updateStatus.textContent = "Updating queue stats...";
-            await fetch("{{ url_for('queue_stats') }}")
-                .then(response => response.text())
-                .then(t => {queue_stats.innerHTML = t;});
-
-            // Update wait estimates
-            updateStatus.textContent = "Updating wait estimates...";
-            await updateWaitEstimate();
-
-            // Update priority ranking
-            updateStatus.textContent = "Updating priority ranking...";
-            await fetch("{{ url_for('priority') }}?" + accountParam())
-                .then(response => response.text())
-                .then(t => {priority.innerHTML = t;});
-
-            // Update queue information
-            updateStatus.textContent = "Updating queue info...";
-            await fetch("{{ url_for('queue') }}?" + accountParam())
-                .then(response => response.text())
-                .then(t => {queue.innerHTML = t;});
-
-            // Update leaderboard information
-            updateStatus.textContent = "Updating leaderboard...";
-            await fetch("{{ url_for('leaderboard') }}")
-                .then(response => response.text())
-                .then(t => {leaderboard.innerHTML = t;});
-
-            // Update allocation information
-            updateStatus.textContent = "Updating allocations...";
-            await fetch("{{ url_for('allocations') }}?" + accountParam())
-                .then(response => response.text())
-                .then(t => {allocations.innerHTML = t;});
-
-            // Update my own running jobs
-            if (myJobsSection.open && Date.now() - myJobsFetchedAt > MY_JOBS_MIN_GAP_MS) {
-                updateStatus.textContent = "Reading my running jobs...";
-                await updateMyJobs();
-            }
-
-            // Update disk quota information
-            updateStatus.textContent = "Updating disk quota...";
-            await fetch("{{ url_for('disk_quota') }}")
-                .then(response => response.text())
-                .then(t => {disk_quota.innerHTML = t;});
-
-            // Update completed
-            updateStatus.textContent = "Update completed!";
-            
             // 重新应用主题样式
             setTimeout(applyThemeStyles, 50);
-            
+
             setTimeout(() => updateStatus.textContent = "", 2000);
-        } catch (error) {
-            updateStatus.textContent = "Update failed!";
-            console.error("Update error:", error);
         } finally {
             // Restore update button
+            updateInFlight = false;
             updateButton.disabled = false;
             updateButton.textContent = "Update All";
         }
