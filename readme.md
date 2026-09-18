@@ -1,153 +1,115 @@
 # Slurm Website Monitor for UVA Rivanna
-A website-based resource monitor for [SLURM](https://slurm.schedmd.com/documentation.html) systems, tailored specifically for the UVA Rivanna computing environment.
 
-This project extends the original implementation developed for the [Visual Geometry Group](https://www.robots.ox.ac.uk/~vgg/), Oxford, with enhancements and customizations to better serve the specific needs of our research group at the University of Virginia.
+A web dashboard for the [SLURM](https://slurm.schedmd.com/documentation.html) scheduler on
+UVA's Rivanna cluster. On a single page it shows what the cluster is doing, where your
+account stands in the queue, and what your own running jobs are consuming.
 
-## Features
-- Parses the results from the `sinfo` command every 1 seconds to update CPU/GPU resource usage.
-- Hosts statistics on an internally accessible webpage, providing a convenient overview of system status.
+The project extends the monitor originally written for the
+[Visual Geometry Group](https://www.robots.ox.ac.uk/~vgg/), Oxford, and is maintained by
+the UVA Computer Vision Lab.
 
-## Interface
+## Table of Contents
 
-The page is one scrolling dashboard. Each block below is a collapsible section that
-refreshes on its own over AJAX, so a slow section never blocks the rest. A dark mode
-toggle, an "Unfold All" button and a manual "Update All" button sit in the header.
+- [Overview](#overview)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Deployment](#deployment)
+  - [Access through Open OnDemand](#access-through-open-ondemand)
+  - [Access through an SSH tunnel](#access-through-an-ssh-tunnel)
+  - [Keeping the monitor running](#keeping-the-monitor-running)
+  - [Troubleshooting](#troubleshooting)
+- [Configuration](#configuration)
+- [Dashboard Reference](#dashboard-reference)
+- [Command-Line Tool](#command-line-tool)
+- [Changelog](#changelog)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
 
-An **account picker** sits in the header as well. Allocations, the wait estimate, the
-per-pool priority and the lab queue all follow whichever account is picked, so the page
-shows one account at a time rather than every account at once; the choice is remembered
-across visits. The accounts on offer come from `LAB_ACCOUNTS` in `app.py`, or from the
-`RIVANNA_ACCOUNTS` environment variable as a comma separated list.
+## Overview
 
-### My Running Jobs (live)
+The dashboard is organised around three questions:
 
-What your own running jobs are actually doing: cores busy against cores reserved,
-resident memory against memory reserved, and per GPU its utilisation, memory, power
-draw and temperature. CPU and RAM come from one `sstat` call; the GPU figures are read
-on the card by a short step inside each job (`srun --overlap`), which is also what
-limits the reading to the GPUs that job holds.
+| Question | Panels |
+| --- | --- |
+| What is the cluster doing? | Resource available, GPU Leaderboard, Queue Overview |
+| Where does my account stand? | Allocations, Estimated Wait, Priority in Each Pool, Waiting Queue |
+| What are my own jobs doing? | My Running Jobs, Disk Quota |
 
-The GPU figures are averages, not snapshots: one `utilization.gpu` reading covers
-1/6--1s and swings between 45% and 100% on a steady job, so `gpu_probe.py` asks NVML for
-the samples the driver has *already* buffered -- ~5s of utilisation, ~2.4s of power, at
-no extra wait. Memory and temperature stay point readings. Hover any bar for its window
-and sample count.
+Design principles:
 
-"My" means the account running `app.py`; SLURM will not report another user's job steps.
-Each refresh starts a step inside every GPU job, so the panel is fetched only while its
-section is open.
+- **On-demand refresh.** Panels load when the page opens, when its tab regains focus, and
+  on *Update All*. Nothing polls in the background.
+- **Independent panels.** All panels are requested concurrently, so a slow or failed panel
+  does not affect the others. A full refresh takes a few seconds.
+- **Low scheduler load.** Identical SLURM queries issued within ten seconds are answered
+  once and shared between panels.
+- **No tunnel required.** The page can be served through Open OnDemand behind NetBadge
+  authentication.
 
-![My Running Jobs](screenshots/my_jobs.png)
+## Requirements
 
-*Trimmed to the first seven jobs; ids, job names and the owner are placeholders.*
+- **A Rivanna login node.** Every panel is built from SLURM client commands (`squeue`,
+  `sinfo`, `scontrol`, `sacct`, `sprio`, `sshare`) and the site tools `allocations` and
+  `hdquota`.
+- **Python 3** (tested with 3.11) and the packages listed in `requirements.txt`.
+- **Your own account.** The monitor runs as the user who starts it. Panels about "you"
+  (*My Running Jobs*, *Disk Quota*, the highlighted leaderboard row) describe that user;
+  SLURM does not report another user's job steps.
 
-### Resource available
+## Quick Start
 
-Live GPU, CPU and memory occupancy for every node, grouped by GPU type and sorted by
-computing power, with a state badge per node (`idle`, `mix`, `alloc`, `drng`, `resv`)
-and the users currently on it. Offline nodes are dimmed and counted separately.
-
-![Resource available](screenshots/resource.png)
-
-*Trimmed to the first four GPU types; the real page lists all of them. Usernames are
-replaced with placeholders in this screenshot.*
-
-### Queue Overview (All Users)
-
-Cluster-wide contention per GPU type: how many GPUs are free, how many jobs are
-waiting, how many GPUs they want, and the resulting queue depth. Jobs that could land
-on more than one GPU type are counted under each, so the `Flexible` column overlaps
-between rows; jobs held by a dependency or a QOS/array limit are split out as
-`Not Competing` rather than inflating the numbers.
-
-![Queue Overview](screenshots/queue_overview.png)
-
-### Estimated Wait for a Standard Job
-
-Answers "if I submit right now, when do I start?" for each GPU pool. Enter a job shape
-(GPUs, CPUs, memory, walltime; the account comes from the header picker) and each row
-replays the scheduler for that pool: every pending job `sprio` ranks above a fresh submission of yours is placed
-first, in priority order with backfill, as running jobs free their GPUs.
-`Worst Case` lets every job run to its time limit; `Typical` cuts each job to the
-fraction of its limit that jobs in that partition actually used over the last 3 days.
-
-![Estimated Wait](screenshots/wait_estimate.png)
-
-### Priority in Each Pool
-
-Where a job submitted right now under the picked account would rank among the jobs
-already queued *in that partition*. Ranking against the whole cluster would be misleading, because the
-partition factor shown next to each pool is added to every job in it alike.
-
-![Priority](screenshots/priority.png)
-
-### Allocations
-
-The picked account's service-unit allocations: allocated, remaining, percent used, and
-which one is currently active. The `allocations` command only reports a balance to
-members of the account, so for an account you are not in the section says so instead of
-showing an empty table.
-
-![Allocations](screenshots/allocations.png)
-
-## News
-- [09/17/2026]: Add a live per-job panel: CPU, RAM, GPU utilisation, GPU memory, power and temperature for your own running jobs, with the GPU figures averaged over a few seconds of the driver's own samples.
-- [09/10/2026]: Add the header account picker, and keep panels up when SLURM or the login node has a bad moment.
-- [09/03/2026]: Add estimated wait time, queue overview, per-pool priority, collapsible sections, and B200 / RTX PRO 6000 partitions.
-- [08/12/2025]: Add Multi-Instance GPU partition
-- [04/29/2025]: Add disk quota, H200 partition, and manual update button.
-- [10/31/2024]: Add allocations.
-- [10/31/2024]: Launched customized version for UVA Rivanna.
-
-## Installation
-To install necessary dependencies, run:
-```
+```sh
+git clone https://github.com/UVA-Computer-Vision-Lab/rivanna_resource.git
+cd rivanna_resource
 pip install -r requirements.txt
+python app.py
 ```
 
-## Usage
-To launch the web monitor:
-```
-python app.py --host localhost --port 8080
-```
-Access the website at `localhost:8080`. Adjust the host and port as needed for your setup.
+The monitor listens on `0.0.0.0:2070` by default; `--host` and `--port` override this.
+The page title shows the node and port it is serving from. See [Deployment](#deployment)
+for how to reach it from your own machine.
 
-Modify the [index.html](index.html) to customize the header, footer, and formatting to suit your group's preferences.
+## Deployment
 
-## Running It Through Open OnDemand
+Login nodes have internal addresses only, so the page cannot be opened directly from
+outside the cluster. Two access paths are supported.
 
-`python app.py` in a terminal stops when that terminal closes, and the page it serves
-sits on a login node's internal address, reachable only through an SSH tunnel. Open
-OnDemand can serve it at a NetBadge-protected URL instead, and a few lines in your shell
-startup file keep it running without starting it by hand.
+### Access through Open OnDemand
 
-It has to run on a login node and as you: every panel comes from SLURM commands, and
-*My Running Jobs* reads your jobs from inside them.
-
-### The URL
-
-OnDemand forwards a port on a cluster node at
+Rivanna's Open OnDemand instance proxies a port on a cluster node at:
 
 ```
 https://ood.hpc.virginia.edu/rnode/<node>/<port>/
 ```
 
-It is `rnode`; `/node/...` answers *Not Found* on Rivanna. `hostname` prints the node,
-and the page's own title shows the node and port it is serving from. Login nodes are
-handed out round-robin, so the node, and with it the URL, can differ from one session
-to the next.
+`<node>` is the host running the monitor (the output of `hostname`) and `<port>` is the
+port it listens on. Access is protected by NetBadge and requires no setup on the client.
 
-### Pick a port of your own
+> [!NOTE]
+> The path is `rnode`. Rivanna does not expose the `/node/` variant, which returns
+> *Not Found*.
 
-Two people on the same login node cannot both listen on 2070. Choose another port above
-1024 and use it for `RIVMON_PORT` below.
+### Access through an SSH tunnel
 
-### Start it when you log in
+```sh
+ssh -L 2070:<node>:2070 <computing-id>@login.hpc.virginia.edu
+```
 
-Rivanna does not let users run `crontab`, `at` or a lingering `systemd --user` service,
-so the way to keep it up is a hook in your shell's startup file. Save this as
-`~/.config/rivmon.sh`, with `RIVMON_DIR` set to your clone and `RIVMON_PORT` to your
-port:
+Then open `http://localhost:2070`. Name the node explicitly: `login.hpc.virginia.edu`
+resolves to several login nodes, so a session may land on a different node from the one
+running the monitor. The monitor must listen on `0.0.0.0` (the default) for this to work.
+
+### Keeping the monitor running
+
+A monitor started from a terminal stops when that terminal closes. Rivanna does not permit
+users to run `crontab`, `at`, or lingering `systemd --user` services, so persistence is
+handled by a hook in the shell startup file.
+
+**1. Choose a port.** Only one process can listen on a given port per node, so users who
+share a login node need different ports. Any free port above 1024 will do.
+
+**2. Create `~/.config/rivmon.sh`**, setting `RIVMON_DIR` to your clone and `RIVMON_PORT`
+to your port:
 
 ```sh
 RIVMON_DIR="$HOME/rivanna_resource"   # where you cloned this repository
@@ -177,44 +139,210 @@ if [[ $- == *i* ]] && [ -d "$RIVMON_DIR" ]; then
 fi
 ```
 
-Then source it from `~/.bashrc`, and from your `.zshrc` too if you use zsh:
+**3. Source it** from `~/.bashrc`, and from `.zshrc` as well if you use zsh:
 
 ```sh
 [ -f "$HOME/.config/rivmon.sh" ] && . "$HOME/.config/rivmon.sh"
 ```
 
-Each interactive shell now starts the monitor if you are not already running it on that
-node, and prints its URL. `rivmon` prints it again later.
+Every interactive shell then starts the monitor, unless you are already running one on
+that node, and prints its OnDemand URL. The `rivmon` command prints the URL again at any
+time.
 
-- `setsid` gives the server a session of its own, so logging out does not stop it. If
-  the login node reboots, it comes back the next time you open a shell there.
-- Nothing runs outside an interactive shell, so `scp`, `rsync` and `ssh host command`
-  are unaffected.
-- Only a listener you own counts as running. If someone else holds the port on that
-  node, you are told so rather than shown their URL as yours.
-- The `python` on your `PATH` needs the packages in `requirements.txt`.
-- Every login node you use keeps its own copy running, so at most one per node.
-- Output goes to `app.log` in the repository, which git ignores.
+How the hook behaves:
+
+- **Survives logout.** `setsid` places the server in a session of its own.
+- **Recovers after a reboot.** The next interactive shell on that node starts it again.
+- **One instance per node.** Login nodes are assigned round-robin. Each node you use runs
+  its own copy, and the URL differs from node to node.
+- **Checks ownership.** Only a listener you own counts as running. If another user holds
+  the port, the hook reports it instead of printing their URL as yours.
+- **Leaves non-interactive shells alone.** Nothing runs outside an interactive shell, so
+  `scp`, `rsync` and `ssh <host> <command>` behave as before.
+- **Logs to a file.** Output is appended to `app.log` in the repository, which git ignores.
+- **Uses your login environment.** The `python` on your `PATH` at login must provide the
+  packages in `requirements.txt`.
+
+### Troubleshooting
+
+| Symptom | Cause | Resolution |
+| --- | --- | --- |
+| OnDemand returns *Not Found* for the whole page | The URL uses `/node/` | Use `/rnode/<node>/<port>/` |
+| OnDemand shows an error instead of the dashboard | Nothing is listening on that node and port | Run `rivmon` on that node; it reports whether you are serving the port |
+| The page loads but every panel shows *Not Found* | A checkout older than 2026-09-18 requests panels from the site root, which the proxy does not rewrite | Update the repository; panels are now requested relative to the page |
+| The hook reports that the port is taken | Another user is listening on that port on the same login node | Set `RIVMON_PORT` to a different port |
+| A saved URL stops working | A new session landed on a different login node | Run `rivmon` for the current URL, or keep using the earlier node's URL while that instance is up |
+| The monitor is gone after maintenance | The login node was rebooted | Open an interactive shell on that node; the hook starts it again |
+
+## Configuration
+
+Settings are environment variables read when `app.py` starts.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RIVANNA_ACCOUNTS` | `uva_cv_lab,cang-lab-in-silico` | Accounts offered by the header picker, comma separated. The first is the default. |
+| `RIVANNA_STANDARD_HOURS` | `24` | Walltime, in hours, that the wait-estimate form starts with. |
+| `RIVANNA_WALLTIME_DAYS` | `3` | Days of finished jobs sampled to measure what fraction of its time limit a job really uses (the `Typical` column). |
+| `RIVANNA_WALLTIME_TTL` | `1800` | Seconds that sample is reused before `sacct` is queried again. |
+| `RIVANNA_TEST_ONLY_TTL` | `60` | Seconds an account's `sbatch --test-only` verdict for a pool is kept. |
+| `RIVANNA_CMD_CACHE_SECONDS` | `10` | Seconds an identical SLURM query is shared between panels; `0` disables sharing. `sstat` is never shared, because the live CPU figure subtracts two readings. |
+
+The header, footer and styling live in [index.html](index.html) and can be adapted to
+your group.
+
+## Dashboard Reference
+
+The header holds an **account picker**, *Update All*, *Unfold All* and a dark mode toggle.
+Panels scoped to an account follow the picker, so the page shows one account at a time;
+the choice is remembered across visits. Sections start collapsed, and the page remembers
+which ones you opened.
+
+| Panel | Scope | Source |
+| --- | --- | --- |
+| [My Running Jobs (live)](#my-running-jobs-live) | You | `squeue`, `sstat`, `srun` |
+| [Resource available](#resource-available) | Cluster | `sinfo`, `squeue`, `scontrol` |
+| [GPU Leaderboard](#gpu-leaderboard) | Cluster | `sinfo`, `squeue` |
+| [Disk Quota](#disk-quota) | You | `hdquota` |
+| [Allocations](#allocations) | Account | `allocations` |
+| [Queue Overview (All Users)](#queue-overview-all-users) | Cluster | `sinfo`, `squeue`, `scontrol` |
+| [Estimated Wait for a Standard Job](#estimated-wait-for-a-standard-job) | Account | `squeue`, `sprio`, `sshare`, `sacct`, `sacctmgr`, `scontrol`, `sinfo`, `sbatch --test-only` |
+| [Priority in Each Pool](#priority-in-each-pool) | Account | `sprio`, `sshare`, `sacctmgr`, `scontrol`, `sinfo` |
+| [Waiting Queue](#waiting-queue) | Account | `squeue` |
+
+*Scope:* **Cluster** covers all users, **Account** is the account chosen in the picker,
+and **You** is the user running `app.py`. Panels are listed in page order.
+
+### My Running Jobs (live)
+
+Resource consumption of your running jobs: busy cores against reserved cores, resident
+memory against reserved memory, and per GPU its utilisation, memory, power draw and
+temperature.
+
+- CPU and memory come from a single `sstat` call covering all jobs.
+- GPU figures are read on the card by a short step inside each job (`srun --overlap`),
+  which also limits the reading to the GPUs that job holds.
+- GPU utilisation and power are averages, not snapshots. One `utilization.gpu` reading
+  covers 1/6--1 s and swings between 45% and 100% on a steady job, so `gpu_probe.py` reads
+  the samples the driver has already buffered (about 5 s of utilisation and 2.4 s of
+  power) at no extra wait. Memory and temperature are point readings. Hover a bar to see
+  its window and sample count.
+- Each refresh starts a step inside every GPU job, so this panel is fetched only while
+  its section is open.
+
+![My Running Jobs](screenshots/my_jobs.png)
+
+*Trimmed to the first seven jobs; ids, job names and the owner are placeholders.*
+
+### Resource available
+
+Live GPU, CPU and memory occupancy for every node, grouped by GPU type and sorted by
+computing power, with a state badge per node (`idle`, `mix`, `alloc`, `drng`, `resv`)
+and the users currently on it. Offline nodes are dimmed and counted separately.
+
+![Resource available](screenshots/resource.png)
+
+*Trimmed to the first four GPU types; usernames are replaced with placeholders.*
+
+### GPU Leaderboard
+
+GPUs held per user, in descending order. Each row lists the user's total, followed by the
+number of 48 GB cards (`48g`), cards newer than the P40/M40 generation (`newer`), cards
+held by interactive rather than batch jobs (`bash`), and the count per GPU type. Users
+are shown as "Full Name (computing ID)", taken from the passwd entry. The row of the user
+running `app.py` is highlighted and prefixed with `>`.
+
+### Disk Quota
+
+The output of `hdquota` as a table: size, used, available and percent used for your home,
+scratch and research storage.
+
+### Allocations
+
+The picked account's service-unit allocations: allocated, remaining, percent used, and
+which one is currently active. The `allocations` command reports a balance only to
+members of the account, so for an account you do not belong to the panel says so instead
+of showing an empty table.
+
+![Allocations](screenshots/allocations.png)
+
+### Queue Overview (All Users)
+
+Cluster-wide contention per GPU type: GPUs free, jobs waiting, GPUs requested, and the
+resulting queue depth. Jobs that could run on more than one GPU type are counted under
+each, so the `Flexible` column overlaps between rows. Jobs held by a dependency or a
+QOS/array limit are reported separately as `Not Competing` rather than inflating the
+numbers.
+
+![Queue Overview](screenshots/queue_overview.png)
+
+### Estimated Wait for a Standard Job
+
+Estimates when a job submitted now would start in each GPU pool. Enter a job shape (GPUs,
+CPUs, memory, walltime; the account comes from the picker) and each row replays the
+scheduler for that pool: every pending job that `sprio` ranks above a fresh submission of
+yours is placed first, in priority order with backfill, as running jobs free their GPUs.
+
+- `Worst Case` lets every job run to its time limit.
+- `Typical` cuts each job to the fraction of its limit that jobs in that partition
+  actually used over the last 3 days.
+
+![Estimated Wait](screenshots/wait_estimate.png)
+
+### Priority in Each Pool
+
+Where a job submitted now under the picked account would rank among the jobs already
+queued *in that partition*. Ranking against the whole cluster would be misleading,
+because the partition factor shown next to each pool is added to every job in it alike.
+
+![Priority](screenshots/priority.png)
+
+### Waiting Queue
+
+The picked account's pending jobs in `squeue`'s own columns: job id, partition, user,
+time limit, nodes, submit time, start time and the reason each job is waiting.
+`START_TIME` is the backfill scheduler's own estimate (what `squeue --start` reports) and
+reads N/A for a job it has not planned, such as a held one.
 
 ## Command-Line Tool
-For command-line usage:
-```
-python slurm_web/slurm_gpustat.py
+
+The same GPU summary is available in the terminal. From the repository root:
+
+```sh
+python slurm_gpustat.py            # current usage
+python available_resources.py      # available resources only
 ```
 
-Alternatively, add this alias to your `.bash_profile`:
-```
-alias slurm_gpustat='python ~/slurm_web/slurm_gpustat.py'
+For convenience, add an alias pointing at your clone to `~/.bashrc`:
+
+```sh
+alias slurm_gpustat='python ~/rivanna_resource/slurm_gpustat.py'
 ```
 
-To view the statistics of only the available resources, run:
-```
-python available_resources.py 
-```
+## Changelog
 
-## Credits
-This project is based on the original `slurm_gpustat` tool developed by [Samuel Albanie](https://github.com/albanie/slurm_gpustat) and `slurm_web
-` developed by [Tengda Han](https://tengdahan.github.io/). It has been modified and maintained for the UVA Rivanna system by the UVA CV Lab, with the aim of providing enhanced monitoring tools for Rivanna.
+- **2026-09-18** -- Faster refresh, about a third of the previous time: panels are fetched
+  concurrently, all nodes are read in one `scontrol` call, and identical SLURM queries are
+  shared. Own row highlighted in the leaderboard, stable ordering of tied GPU types, and
+  access through Open OnDemand.
+- **2026-09-17** -- Live per-job panel: CPU, RAM, GPU utilisation, GPU memory, power and
+  temperature for your own running jobs, with GPU figures averaged over a few seconds of
+  the driver's own samples.
+- **2026-09-10** -- Header account picker; panels stay up when SLURM or the login node has
+  a bad moment.
+- **2026-09-03** -- Estimated wait time, queue overview, per-pool priority, collapsible
+  sections, and the B200 / RTX PRO 6000 partitions.
+- **2025-08-12** -- Multi-Instance GPU partition.
+- **2025-04-29** -- Disk quota, H200 partition, and manual update button.
+- **2024-10-31** -- Allocations panel; first customized release for UVA Rivanna.
 
-## Reference
-Further documentation and updates can be found at the original [slurm_gpustat repository](https://github.com/albanie/slurm_gpustat).
+## Acknowledgements
+
+Based on [`slurm_gpustat`](https://github.com/albanie/slurm_gpustat) by
+[Samuel Albanie](https://github.com/albanie) and `slurm_web` by
+[Tengda Han](https://tengdahan.github.io/). Adapted and maintained for Rivanna by the UVA
+Computer Vision Lab. Further documentation of the original command-line tool is available
+in the [slurm_gpustat repository](https://github.com/albanie/slurm_gpustat).
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE).
