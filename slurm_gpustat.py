@@ -530,28 +530,8 @@ def lru_cache_time(seconds, maxsize=None):
     return wrapper
 
 
-@lru_cache_time(seconds=10)
-def avail_stats_for_node(node: str) -> dict:
-    """Query SLURM for the availability of a given node.
-
-    Args:
-        (node): the name of the node to query
-
-    Returns:
-        a mapping between node names and availability stats.
-    """
-    cmd = f"scontrol show node {node}"
-    try:
-        # One attempt only: this runs once per node, so retrying every node
-        # would stall the whole page, and the caller copes with the fallback.
-        rows = [x.strip() for x in parse_cmd(cmd, retries=1)]
-    except subprocess.CalledProcessError as exc:
-        reason = " ".join((exc.stderr or b"").decode("utf-8", "replace").split())
-        print(
-            f"Warning: could not read node {node} (exit {exc.returncode}: "
-            f"{reason or 'no stderr'}), reporting it as empty"
-        )
-        return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
+def _tres_occupancy(node: str, rows: list) -> dict:
+    """Free/total cpu and mem for one `scontrol show node` record."""
     keys = ("AllocTRES", "CfgTRES")
     metrics = {}
     for row in rows:
@@ -565,9 +545,10 @@ def avail_stats_for_node(node: str) -> dict:
                     # print(f"Missing information for {node}: {key}, skipping....")
                     metrics[key] = {}
                 else:
-                    metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1] 
+                    metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1]
                                    for token in tokens if "=" in token}
     if "CfgTRES" not in metrics or "AllocTRES" not in metrics:
+        print(f"Warning: node {node} reported no TRES totals, showing it as empty")
         return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
     occupancy = {}
     for metric, cfg_val in metrics["CfgTRES"].items():
@@ -586,6 +567,51 @@ def avail_stats_for_node(node: str) -> dict:
         else:
             occupancy[metric] = f"{hf.parse_size(cfg_val)-hf.parse_size(alloc_val)} / {hf.parse_size(cfg_val)}"
     return occupancy
+
+
+@lru_cache_time(seconds=10)
+def _avail_stats_by_node() -> dict:
+    """Availability for every node on the cluster, from a single scontrol call.
+
+    Asking node by node costs one RPC each, and the resource panel walks about a
+    hundred GPU nodes, so that alone was several seconds of every page refresh.
+    One `scontrol show node` returns all of them in about the time a single-node
+    query takes, so read the whole table once and let callers index into it.
+    Records start at an unindented NodeName=; every other line is indented.
+    """
+    try:
+        rows = parse_cmd("scontrol show node")
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"Warning: could not read the node table ({exc}), showing every node as empty")
+        return {}
+    records, node = {}, None
+    for row in rows:
+        if row.startswith("NodeName="):
+            node = row.split()[0].split("=", 1)[1]
+            records[node] = []
+        elif node is not None:
+            records[node].append(row.strip())
+        else:
+            print(f"Warning: line before any NodeName= in scontrol output, ignoring it: {row.strip()!r}")
+    return {name: _tres_occupancy(name, rows) for name, rows in records.items()}
+
+
+def avail_stats_for_node(node: str) -> dict:
+    """Query SLURM for the availability of a given node.
+
+    Args:
+        (node): the name of the node to query
+
+    Returns:
+        a mapping between node names and availability stats.
+    """
+    stats = _avail_stats_by_node().get(node)
+    if stats is None:
+        print(f"Warning: no scontrol record for node {node}, showing it as empty")
+        return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
+    # The cache hands out one dict per node, so copy it rather than let a caller
+    # edit what the next caller will read.
+    return dict(stats)
 
 
 @beartype
