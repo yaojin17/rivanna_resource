@@ -1040,6 +1040,14 @@ NO_ACCESS_MARKERS = (
 NOT_A_MEMBER_MARKER = "Invalid account"
 # Pools already reported as inaccessible, so the log is not repeated on every refresh.
 _reported_no_access = set()
+# Whether an account may use a pool is account, QOS and partition configuration,
+# which barely moves between refreshes, yet the panel asked slurmctld to simulate
+# the same fourteen jobs on every one.  One marker above does follow live state:
+# "Requested node configuration is not available" also fires while every node of
+# a type is drained, so the verdict is kept briefly rather than for the life of
+# the process, and a pool that comes back is picked up within the TTL.
+TEST_ONLY_CACHE_SECONDS = int(os.environ.get("RIVANNA_TEST_ONLY_TTL", "60"))
+_test_only_cache = {}
 # Union partitions already reported as skipped, for the same reason.
 _reported_unions = set()
 
@@ -1252,25 +1260,38 @@ def _test_only_check(spec, account):
         f"--gres=gpu:{spec['gpu_type']}:{spec['gpus']} -c {spec['cpus']} "
         f"--mem={spec['mem_mb']}M -t {spec['minutes']} --wrap=hostname"
     )
+    key = (
+        account, spec["partition"], spec["gpu_type"],
+        spec["gpus"], spec["cpus"], spec["mem_mb"], spec["minutes"],
+    )
+    now = time.monotonic()
+    cached = _test_only_cache.get(key)
+    if cached is not None and now - cached[0] < TEST_ONLY_CACHE_SECONDS:
+        return cached[1]
+
     try:
         out = check_output(cmd, shell=True, stderr=STDOUT).decode("utf-8")
     except CalledProcessError as exc:
         out = exc.output.decode("utf-8")
     if re.search(r"to start at (\S+)", out):
-        return None
-    lines = out.strip().splitlines()
-    reason = lines[-1].replace("sbatch: error: ", "") if lines else "no output"
-    pool = (spec["partition"], spec["gpu_type"])
-    if any(marker in reason for marker in NO_ACCESS_MARKERS):
-        if pool not in _reported_no_access:
-            _reported_no_access.add(pool)
-            print(
-                f"Note: {account} has no schedulable node for {spec['gpu_type']} in "
-                f"{spec['partition']} ({reason}); leaving that pool out of the estimates"
-            )
-        return ("no_access", reason)
-    print(f"Warning: {spec['gpu_type']} on {spec['partition']} rejects this job shape: {reason}")
-    return ("error", reason)
+        verdict = None
+    else:
+        lines = out.strip().splitlines()
+        reason = lines[-1].replace("sbatch: error: ", "") if lines else "no output"
+        pool = (spec["partition"], spec["gpu_type"])
+        if any(marker in reason for marker in NO_ACCESS_MARKERS):
+            if pool not in _reported_no_access:
+                _reported_no_access.add(pool)
+                print(
+                    f"Note: {account} has no schedulable node for {spec['gpu_type']} in "
+                    f"{spec['partition']} ({reason}); leaving that pool out of the estimates"
+                )
+            verdict = ("no_access", reason)
+        else:
+            print(f"Warning: {spec['gpu_type']} on {spec['partition']} rejects this job shape: {reason}")
+            verdict = ("error", reason)
+    _test_only_cache[key] = (now, verdict)
+    return verdict
 
 
 # ------------------------------------------------------------ queue snapshot
