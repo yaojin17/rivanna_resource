@@ -13,6 +13,7 @@ import re
 import ast
 import sys
 import time
+import threading
 import atexit
 import signal
 import argparse
@@ -360,7 +361,29 @@ def parse_node_names(node_str):
     return names
 
 
-def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
+# A full page refresh fetches every panel at once and several of them ask SLURM
+# the same question: the same squeue, sinfo and scontrol lines were being run
+# three and four times over, about 1.3s of the roughly 7s a refresh spends in
+# subprocesses.  Hold each answer briefly, and make callers that ask while one is
+# still in flight wait for it rather than start a second copy, which is the case
+# a plain expiry would miss when eight panels start together.
+CMD_CACHE_SECONDS = int(os.environ.get("RIVANNA_CMD_CACHE_SECONDS", "10"))
+# sstat readings are subtracted from one another to turn counters into a rate, so
+# two calls a few seconds apart have to be two different readings.
+UNCACHEABLE_COMMANDS = ("sstat",)
+_cmd_cache = {}
+_cmd_cache_guard = threading.Lock()
+_cmd_locks = {}
+
+
+def _cmd_is_cacheable(cmd):
+    if CMD_CACHE_SECONDS <= 0:
+        return False
+    head = cmd.split()[0] if cmd.split() else ""
+    return head not in UNCACHEABLE_COMMANDS
+
+
+def _run_slurm_cmd(cmd, split, retries, delay):
     """Parse the output of a shell command...
      and if split set to true: split into a list of strings, one per line of output.
 
@@ -408,6 +431,44 @@ def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
     if split:
         output = [x for x in output.split("\n") if x]
     return output
+
+
+def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
+    """Run a SLURM query, reusing an answer from the last CMD_CACHE_SECONDS.
+
+    See :func:`_run_slurm_cmd` for what actually runs and why it retries.
+    """
+    if not _cmd_is_cacheable(cmd):
+        return _run_slurm_cmd(cmd, split, retries, delay)
+
+    key = (cmd, split)
+
+    def _fresh():
+        """The cached answer if it is still young enough, else None."""
+        with _cmd_cache_guard:
+            entry = _cmd_cache.get(key)
+        if entry is None or time.monotonic() - entry[0] >= CMD_CACHE_SECONDS:
+            return None
+        # Callers get their own list, so one of them sorting it in place cannot
+        # reshuffle what the next caller reads out of the cache.
+        return list(entry[1]) if isinstance(entry[1], list) else entry[1]
+
+    hit = _fresh()
+    if hit is not None:
+        return hit
+
+    with _cmd_cache_guard:
+        lock = _cmd_locks.setdefault(key, threading.Lock())
+    with lock:
+        # Whoever held this lock has just filled the cache, so look again before
+        # running a second copy of their command.
+        hit = _fresh()
+        if hit is not None:
+            return hit
+        output = _run_slurm_cmd(cmd, split, retries, delay)
+        with _cmd_cache_guard:
+            _cmd_cache[key] = (time.monotonic(), output)
+    return list(output) if isinstance(output, list) else output
 
 
 @beartype
