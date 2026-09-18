@@ -38,7 +38,6 @@ for _blas_var in (
 
 import numpy as np
 import colored
-# import seaborn as sns  # Not used in this file
 import humanize
 import humanfriendly as hf
 from beartype import beartype

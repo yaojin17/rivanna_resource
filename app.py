@@ -49,7 +49,6 @@ from slurm_gpustat import (
     parse_node_names,
     get_gpu_partitions,
 )
-# import gradio as gr  # Not used in this file
 
 # from https://developer.nvidia.com/cuda-gpus
 # sort gpu by computing power

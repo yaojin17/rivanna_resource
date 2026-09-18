@@ -1,10 +1,9 @@
 numpy
 beartype
-seaborn
 colored
 django
 flask
 humanfriendly
 humanize
-gradio
 pandas
+pytz
