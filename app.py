@@ -3061,9 +3061,16 @@ def parse_my_jobs_to_table():
         )
 
     jobids = [job["jobid"] for job in jobs]
-    usage = _sstat_usage(jobids)
     gpu_jobs = [job["jobid"] for job in jobs if _alloc_gpu_count(job["tres-alloc"])]
-    probes = _probe_gpus(gpu_jobs)
+    # The two wait on different things -- sstat on the accounting plugin, the
+    # probes on the nodes running the jobs -- and neither needs the other, so
+    # overlap them instead of paying for both in turn.  One extra thread next to
+    # the pool the probes already use.
+    with ThreadPoolExecutor(max_workers=1) as reader:
+        counters = reader.submit(_sstat_usage, jobids)
+        probes = _probe_gpus(gpu_jobs)
+        # result() re-raises, so an sstat failure still reaches slurm_response.
+        usage = counters.result()
 
     # Jobs that have ended since the last refresh must not keep a sample around,
     # or a recycled job id would be handed someone else's counter.
