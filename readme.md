@@ -114,6 +114,88 @@ Access the website at `localhost:8080`. Adjust the host and port as needed for y
 
 Modify the [index.html](index.html) to customize the header, footer, and formatting to suit your group's preferences.
 
+## Running It Through Open OnDemand
+
+`python app.py` in a terminal stops when that terminal closes, and the page it serves
+sits on a login node's internal address, reachable only through an SSH tunnel. Open
+OnDemand can serve it at a NetBadge-protected URL instead, and a few lines in your shell
+startup file keep it running without starting it by hand.
+
+It has to run on a login node and as you: every panel comes from SLURM commands, and
+*My Running Jobs* reads your jobs from inside them.
+
+### The URL
+
+OnDemand forwards a port on a cluster node at
+
+```
+https://ood.hpc.virginia.edu/rnode/<node>/<port>/
+```
+
+It is `rnode`; `/node/...` answers *Not Found* on Rivanna. `hostname` prints the node,
+and the page's own title shows the node and port it is serving from. Login nodes are
+handed out round-robin, so the node, and with it the URL, can differ from one session
+to the next.
+
+### Pick a port of your own
+
+Two people on the same login node cannot both listen on 2070. Choose another port above
+1024 and use it for `RIVMON_PORT` below.
+
+### Start it when you log in
+
+Rivanna does not let users run `crontab`, `at` or a lingering `systemd --user` service,
+so the way to keep it up is a hook in your shell's startup file. Save this as
+`~/.config/rivmon.sh`, with `RIVMON_DIR` set to your clone and `RIVMON_PORT` to your
+port:
+
+```sh
+RIVMON_DIR="$HOME/rivanna_resource"   # where you cloned this repository
+RIVMON_PORT=2070                      # a port of your own; see above
+
+# The monitor's URL on this node, with a warning if you are not serving it.
+rivmon() {
+    printf 'https://ood.hpc.virginia.edu/rnode/%s/%s/\n' "$(hostname)" "$RIVMON_PORT"
+    ss -lntpH "sport = :$RIVMON_PORT" 2>/dev/null | grep -q 'users:((' || {
+        echo "rivmon: you are not serving port $RIVMON_PORT on $(hostname)" >&2
+        return 1
+    }
+}
+
+if [[ $- == *i* ]] && [ -d "$RIVMON_DIR" ]; then
+    if ss -lntpH "sport = :$RIVMON_PORT" 2>/dev/null | grep -q 'users:(('; then
+        echo "Rivanna monitor: $(rivmon)"
+    elif ss -lntH "sport = :$RIVMON_PORT" 2>/dev/null | grep -q .; then
+        echo "Rivanna monitor: port $RIVMON_PORT is taken by someone else on" \
+             "$(hostname); set RIVMON_PORT to another" >&2
+    else
+        ( cd "$RIVMON_DIR" && setsid nohup python app.py --host 0.0.0.0 \
+            --port "$RIVMON_PORT" >> "$RIVMON_DIR/app.log" 2>&1 < /dev/null & ) \
+            >/dev/null 2>&1
+        echo "Rivanna monitor: https://ood.hpc.virginia.edu/rnode/$(hostname)/$RIVMON_PORT/"
+    fi
+fi
+```
+
+Then source it from `~/.bashrc`, and from your `.zshrc` too if you use zsh:
+
+```sh
+[ -f "$HOME/.config/rivmon.sh" ] && . "$HOME/.config/rivmon.sh"
+```
+
+Each interactive shell now starts the monitor if you are not already running it on that
+node, and prints its URL. `rivmon` prints it again later.
+
+- `setsid` gives the server a session of its own, so logging out does not stop it. If
+  the login node reboots, it comes back the next time you open a shell there.
+- Nothing runs outside an interactive shell, so `scp`, `rsync` and `ssh host command`
+  are unaffected.
+- Only a listener you own counts as running. If someone else holds the port on that
+  node, you are told so rather than shown their URL as yours.
+- The `python` on your `PATH` needs the packages in `requirements.txt`.
+- Every login node you use keeps its own copy running, so at most one per node.
+- Output goes to `app.log` in the repository, which git ignores.
+
 ## Command-Line Tool
 For command-line usage:
 ```
