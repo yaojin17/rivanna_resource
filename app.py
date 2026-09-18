@@ -20,6 +20,7 @@ import argparse
 import functools
 import json
 import pwd
+import socket
 import bisect
 import copy
 import time
@@ -3217,7 +3218,10 @@ def main():
     def index():
         return render_template_string(
             open("index.html").read(),
-            hostname=args.host,
+            # The node this is serving from, not the bind address: it is what
+            # goes in the OnDemand URL (/rnode/<host>/<port>/) that reaches it,
+            # and "0.0.0.0" told nobody anything.
+            hostname=f"{socket.gethostname()}:{args.port}",
             accounts=LAB_ACCOUNTS,
             my_jobs_min_gap_ms=CPU_SAMPLE_MIN_GAP * 1000,
         )
