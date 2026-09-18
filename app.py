@@ -76,6 +76,18 @@ CAPABILITY = {
     "rtx6k": 7.5,
     "rtx8k": 7.5,
 }
+
+
+def _type_rank(gpu_type):
+    """Sort key putting the most capable GPU first, ties broken by name.
+
+    Several types share a capability number (a40, a6000 and rtx_3090 are all
+    8.6), and the lists being sorted are built from sets, whose order follows
+    string hashing and so is randomised per process. Without the name the tied
+    types came out in a different order every time the app was restarted.
+    """
+    return (-CAPABILITY.get(gpu_type, 10.0), gpu_type)
+
 GMEM = {
     "mig": "[11g]",
     "1g.10gb": "[10g]",
@@ -161,8 +173,7 @@ def _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner):
         f"{key}={val}"
         for key, val in sorted(
             subdict["n_gpu"].items(),
-            key=lambda x: CAPABILITY.get(x[0], 10.0),
-            reverse=True,
+            key=lambda x: _type_rank(x[0]),
         )
     ]
     summary_str = "".join([f"{i:<16s}" for i in user_summary])
@@ -539,11 +550,7 @@ def parse_usage_to_table(show_bar=True):
 
     all_gpu_types = set(res_total_by_type.keys()) | set(res_down_by_type.keys())
 
-    type_list = sorted(
-        list(all_gpu_types),
-        key=lambda x: CAPABILITY.get(x, 10.0),
-        reverse=True,
-    )
+    type_list = sorted(all_gpu_types, key=_type_rank)
     gpu_type_list = [t for t in type_list if not _is_mig_type(t)]
     mig_type_list = [t for t in type_list if _is_mig_type(t)]
 
@@ -878,7 +885,7 @@ def parse_queue_stats_to_table():
     free_by_type = pools["free_by_type"]
 
     all_types = set(committed) | set(flexible) | set(total_by_type)
-    type_list = sorted(all_types, key=lambda x: CAPABILITY.get(x, 10.0), reverse=True)
+    type_list = sorted(all_types, key=_type_rank)
     gpu_type_list = [t for t in type_list if not _is_mig_type(t)]
     mig_type_list = [t for t in type_list if _is_mig_type(t)]
 
