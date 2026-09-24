@@ -95,5 +95,6 @@ Ranks are per partition because the partition factor is added to every job in it
 
 *Scope: account · Built from `squeue`*
 
-Your account's pending jobs with `squeue`'s own columns. `START_TIME` is SLURM's own
-estimate and reads N/A for jobs it has not planned, such as held ones.
+Your account's pending jobs with `squeue`'s own columns. `GPUS` is the total number
+of GPUs requested by each job or array task; CPU-only jobs show `0`. `START_TIME` is
+SLURM's own estimate and reads N/A for jobs it has not planned, such as held ones.

@@ -1630,7 +1630,14 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
     # is simply full then.
     np.maximum(avail, 0, out=avail)
 
+    unplaceable = set()
+    earliest_by_job = {}
     for job in list(queue) + [ours]:
+        # Expanded array tasks share one job dict. Once one cannot fit, later
+        # copies cannot fit either: queued placements only consume resources
+        # and array throttle slots within this fixed horizon.
+        if id(job) in unplaceable:
+            continue
         minutes = job["minutes"]
         if ratio is not None and job is not ours:
             minutes = max(minutes * ratio, 1)
@@ -1639,26 +1646,49 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
             if job is ours:
                 return None
             continue
-        ok = (
-            (avail[0] >= job["gpn"]) & (avail[1] >= job["cpn"]) & (avail[2] >= job["mpn"])
-        )
         if job["throttle"]:
             use = array_use.setdefault(job["array"], np.zeros(buckets, dtype=np.int64))
-            ok &= (use < job["throttle"])[None, :]
-        # A window fits when it holds no bad bucket: compare cumulative counts.
-        bad = np.cumsum(~ok, axis=1)
-        bad = np.concatenate([np.zeros((len(names), 1), dtype=bad.dtype), bad], axis=1)
-        fits = (bad[:, span:] - bad[:, :-span]) == 0  # [node, start bucket]
-        starts = np.nonzero(fits.sum(axis=0) >= job["nodes"])[0]
-        if not len(starts):
+        # Most jobs start early. Search the first day, then double the range
+        # until a window fits or the full horizon has been checked. Each chunk
+        # overlaps by span - 1 buckets so every possible start is examined.
+        possible_starts = buckets - span + 1
+        # Availability only falls as earlier jobs are placed, so another copy
+        # of this array task cannot start before the previous copy did.
+        first = earliest_by_job.get(id(job), 0)
+        limit = min(first + 24 * 60 // PLAN_MINUTES, possible_starts)
+        start = None
+        while True:
+            end = limit + span - 1
+            ok = (
+                (avail[0, :, first:end] >= job["gpn"])
+                & (avail[1, :, first:end] >= job["cpn"])
+                & (avail[2, :, first:end] >= job["mpn"])
+            )
+            if job["throttle"]:
+                ok &= (use[first:end] < job["throttle"])[None, :]
+            # A window fits when it holds no bad bucket.
+            bad = np.cumsum(~ok, axis=1, dtype=np.int32)
+            bad = np.concatenate([np.zeros((len(names), 1), dtype=bad.dtype), bad], axis=1)
+            fits = (bad[:, span:] - bad[:, :-span]) == 0
+            starts = np.nonzero(fits.sum(axis=0) >= job["nodes"])[0]
+            if len(starts):
+                relative_start = int(starts[0])
+                start = first + relative_start
+                candidates = np.nonzero(fits[:, relative_start])[0]
+                break
+            if limit == possible_starts:
+                break
+            first = limit
+            limit = min(limit * 2, possible_starts)
+        if start is None:
             if job is ours:
                 return None
             # Never fits inside the horizon: it cannot delay us either.
+            unplaceable.add(id(job))
             continue
-        start = int(starts[0])
         if job is ours:
             return now + timedelta(minutes=start * PLAN_MINUTES)
-        candidates = np.nonzero(fits[:, start])[0]
+        earliest_by_job[id(job)] = start
         # Best fit: the nodes with the fewest GPUs free at that time, so that
         # whole nodes stay open for the multi-node jobs.
         chosen = sorted(candidates, key=lambda i: (avail[0, i, start], avail[1, i, start]))
@@ -2258,13 +2288,19 @@ def parse_queue_to_table(account=None):
     START_TIME is SLURM's own estimate (what ``squeue --start`` reports), filled
     in by the backfill scheduler; it reads N/A for jobs it has not planned, such
     as held ones. State and elapsed time are left out because every row here is
-    PENDING at 0:00. Both timestamps drop the year, which only widened the table.
+    PENDING at 0:00. GPUS is the total requested by one job or array task, read
+    from its allocated TRES. Both timestamps drop the year to keep the table narrow.
 
     The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
     carries no shell syntax.
     """
     account = account or LAB_ACCOUNTS[0]
-    rows = parse_cmd(f"squeue -a -h -t PENDING -A {account} -o '%i|%P|%u|%l|%D|%V|%S|%R'")
+    columns = (
+        ("JobId", 32), ("Partition", 80), ("UserName", 16), ("TimeLimit", 14),
+        ("tres-alloc", 160), ("SubmitTime", 22), ("StartTime", 22), ("Reason", 120),
+    )
+    fmt = ",".join(f"{name}:{width}" for name, width in columns)
+    rows = parse_cmd(f"squeue -a -h -t PENDING -A {account} -O '{fmt}'")
     if not rows:
         return f"no pending job in {account}"
 
@@ -2285,17 +2321,19 @@ def parse_queue_to_table(account=None):
         return f"{days}d{hours}h" if hours else f"{days}d"
 
     line = "{:>10} {:>14} {:>8} {:>6} {:>5} {:>11} {:>11}  {}"
-    out = [line.format("JOBID", "PARTITION", "USER", "LIMIT", "NODES",
+    out = [line.format("JOBID", "PARTITION", "USER", "LIMIT", "GPUS",
                        "SUBMIT_TIME", "START_TIME", "NODELIST(REASON)")]
     for row in rows:
-        fields = row.split("|", 7)
-        if len(fields) < 8:
-            print(f"Warning: unexpected squeue row {row!r} for {account}, skipping")
-            continue
-        jobid, partition, user, limit, nodes, submit, start, reason = fields
+        fields = []
+        pos = 0
+        for _, width in columns:
+            fields.append(row[pos : pos + width].strip())
+            pos += width
+        jobid, partition, user, limit, tres, submit, start, reason = fields
         # A job queued on several partitions lists all of them; cut it to the
         # column like squeue itself would rather than stretching every row.
-        out.append(line.format(jobid, partition[:14], user, _limit(limit), nodes,
+        out.append(line.format(jobid, partition[:14], user, _limit(limit),
+                               _alloc_gpu_count(tres),
                                _short(submit), _short(start), reason))
     return "\n".join(out)
 
