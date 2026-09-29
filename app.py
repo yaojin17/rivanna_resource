@@ -258,15 +258,16 @@ def cpu_usage(resources, partition="compute"):
     Returns:
         (dict): a summary of resources organised by user (and also by node name).
     """
-    cmd = "squeue -a -O NumNodes:100,nodelist:100,username:100,jobid:100 --noheader"
+    # RUNNING only, as in gpu_usage: a COMPLETING job has already released its node
+    cmd = "squeue -a -t RUNNING -O NumNodes:100,nodelist:100,username:100,jobid:100 --noheader"
     if partition:
         cmd += f" --partition={partition}"
     rows = parse_cmd(cmd)
     usage = defaultdict(dict)
     for row in rows:
         tokens = row.split()
-        # ignore pending jobs
         if len(tokens) < 4:
+            print(f"Warning: unexpected squeue row {row!r}, skipping")
             continue
         cpu_count_str, node_str, user, jobid = tokens
         num_cpus = int(cpu_count_str.strip())

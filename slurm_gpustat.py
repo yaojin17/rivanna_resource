@@ -782,6 +782,32 @@ def _get_slurm_version():
     return parse_cmd("sinfo -V", split=False).split(" ")[1]
 
 
+def _gpus_per_node_from_alloc(extra_tokens: list, jobid: str) -> int:
+    """GPUs per node for a job whose tres-per-node names none.
+
+    ``extra_tokens`` is ``[NumNodes, tres-alloc]``, or empty on SLURM before 21
+    where those columns are not asked for. tres-alloc's ``gres/gpu=N`` is the
+    job's total over all its nodes.
+    """
+    if not extra_tokens:
+        return 0
+    if len(extra_tokens) != 2:
+        print(f"Warning: job {jobid} has unexpected NumNodes/tres-alloc {extra_tokens!r}, "
+              "not counting its GPUs")
+        return 0
+    num_nodes, tres_alloc = extra_tokens
+    total = 0
+    for item in tres_alloc.split(","):
+        key, _, val = item.partition("=")
+        if key == "gres/gpu":
+            total = int(val)
+    nodes = int(num_nodes)
+    if total % nodes:
+        print(f"Warning: job {jobid} holds {total} GPUs over {nodes} nodes, "
+              f"counting {total // nodes} per node")
+    return total // nodes
+
+
 @beartype
 def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,gpu-b200,gpu-rtxpro6000,interactive-rtx3090,interactive-rtx2080,gpu-h200,gpu-mig,gpu-mig-a100,gpu-mig-rtxpro6000,dedicated") -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
@@ -803,20 +829,34 @@ def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-
     else:
         gpu_identifier = 'gpu'
 
-    cmd = f"squeue -a -O {resource_flag}:100,nodelist:100,username:100,jobid:100,BatchFlag:10 --noheader"
+    columns = f"{resource_flag}:100,nodelist:100,username:100,jobid:100,BatchFlag:10"
+    if int(slurm_version[0:2]) >= 21:
+        # A job that asks with --gpus or --gpus-per-task has no tres-per-node;
+        # its GPUs only show up in its allocation.
+        columns += ",NumNodes:10,tres-alloc:300"
+    # RUNNING only: a COMPLETING job still lists its nodes, but SLURM has
+    # already given its GPUs back to the node and to the user's QOS limit.
+    cmd = f"squeue -a -t RUNNING -O {columns} --noheader"
     if partition:
         cmd += f" --partition={partition}"
     rows = parse_cmd(cmd)
     usage = defaultdict(dict)
     for row in rows:
         tokens = row.split()
-        # ignore pending jobs
-        if len(tokens) < 5 or not tokens[0].startswith(gpu_identifier):
+        if len(tokens) < 5:
+            print(f"Warning: unexpected squeue row {row!r}, skipping")
             continue
-        gpu_count_str, node_str, user, jobid, batch_flag = tokens
-        gpu_count_tokens = gpu_count_str.split(":")
-        if not gpu_count_tokens[-1].isdigit():
-            gpu_count_tokens.append("1")
+        gpu_count_str, node_str, user, jobid, batch_flag = tokens[:5]
+        if gpu_count_str.startswith(gpu_identifier):
+            gpu_count_tokens = gpu_count_str.split(":")
+            if not gpu_count_tokens[-1].isdigit():
+                gpu_count_tokens.append("1")
+        else:
+            per_node = _gpus_per_node_from_alloc(tokens[5:], jobid)
+            # A CPU-only job (e.g. on the dedicated nodes) holds no GPU to count
+            if not per_node:
+                continue
+            gpu_count_tokens = [gpu_identifier, str(per_node)]
         num_gpus = int(gpu_count_tokens[-1])
         is_bash = batch_flag.strip() == "0"
         num_bash_gpus = num_gpus * is_bash
