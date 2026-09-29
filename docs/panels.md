@@ -91,6 +91,14 @@ Ranks are per partition because the partition factor is added to every job in it
 
 ![Priority](../screenshots/priority.png)
 
+## Running Jobs
+
+*Scope: account · Built from `squeue`*
+
+Your account's running jobs with `squeue`'s own columns: how long each has run, its
+time limit, the GPUs it holds (`0` for CPU-only jobs), when it started and on which
+nodes. The last line totals the account's running jobs and GPUs.
+
 ## Waiting Queue
 
 *Scope: account · Built from `squeue`*

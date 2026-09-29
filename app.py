@@ -2283,6 +2283,26 @@ def parse_priority_to_table(account=None):
     )
     return f"<table>{header}{body}</table>{note}"
 
+def _short_stamp(stamp):
+    """2026-09-17T16:15:17 -> 09-17 16:15; N/A and the like pass through."""
+    match = re.fullmatch(r"\d{4}-(\d\d-\d\d)T(\d\d:\d\d):\d\d", stamp)
+    return f"{match.group(1)} {match.group(2)}" if match else stamp
+
+
+def _short_limit(text):
+    """3-00:00:00 -> 3d, 1-12:00:00 -> 1d12h, 12:00:00 -> 12h.
+
+    Rounded up to the hour, so a limit is never shown shorter than it really is.
+    """
+    minutes = _slurm_time_to_minutes(text)
+    if minutes is None:
+        return text
+    days, hours = divmod(-(-minutes // 60), 24)
+    if not days:
+        return f"{hours}h"
+    return f"{days}d{hours}h" if hours else f"{days}d"
+
+
 def parse_queue_to_table(account=None):
     """Pending jobs of ``account``, laid out like squeue's own columns.
 
@@ -2305,22 +2325,6 @@ def parse_queue_to_table(account=None):
     if not rows:
         return f"no pending job in {account}"
 
-    def _short(stamp):
-        # 2026-09-17T16:15:17 -> 09-17 16:15; N/A and the like pass through.
-        match = re.fullmatch(r"\d{4}-(\d\d-\d\d)T(\d\d:\d\d):\d\d", stamp)
-        return f"{match.group(1)} {match.group(2)}" if match else stamp
-
-    def _limit(text):
-        # 3-00:00:00 -> 3d, 1-12:00:00 -> 1d12h, 12:00:00 -> 12h. Rounded up to
-        # the hour, so a limit is never shown shorter than it really is.
-        minutes = _slurm_time_to_minutes(text)
-        if minutes is None:
-            return text
-        days, hours = divmod(-(-minutes // 60), 24)
-        if not days:
-            return f"{hours}h"
-        return f"{days}d{hours}h" if hours else f"{days}d"
-
     line = "{:>10} {:>14} {:>8} {:>6} {:>5} {:>11} {:>11}  {}"
     out = [line.format("JOBID", "PARTITION", "USER", "LIMIT", "GPUS",
                        "SUBMIT_TIME", "START_TIME", "NODELIST(REASON)")]
@@ -2333,9 +2337,54 @@ def parse_queue_to_table(account=None):
         jobid, partition, user, limit, tres, submit, start, reason = fields
         # A job queued on several partitions lists all of them; cut it to the
         # column like squeue itself would rather than stretching every row.
-        out.append(line.format(jobid, partition[:14], user, _limit(limit),
+        out.append(line.format(jobid, partition[:14], user, _short_limit(limit),
                                _alloc_gpu_count(tres),
-                               _short(submit), _short(start), reason))
+                               _short_stamp(submit), _short_stamp(start), reason))
+    return "\n".join(out)
+
+
+def parse_running_to_table(account=None):
+    """Running jobs of ``account``, the counterpart of the waiting queue.
+
+    TIME is how long the job has run and START_TIME when it started, both as
+    squeue reports them. GPUS is what the job holds, read from its allocated
+    TRES. The last line totals the account's jobs and GPUs.
+
+    The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
+    carries no shell syntax.
+    """
+    account = account or LAB_ACCOUNTS[0]
+    columns = (
+        ("JobId", 32), ("Partition", 80), ("UserName", 16), ("TimeUsed", 14),
+        ("TimeLimit", 14), ("tres-alloc", 160), ("StartTime", 22), ("NodeList", 200),
+    )
+    fmt = ",".join(f"{name}:{width}" for name, width in columns)
+    rows = parse_cmd(f"squeue -a -h -t RUNNING -A {account} -O '{fmt}'")
+    if not rows:
+        return f"no running job in {account}"
+
+    jobs = []
+    for row in rows:
+        fields = []
+        pos = 0
+        for _, width in columns:
+            fields.append(row[pos : pos + width].strip())
+            pos += width
+        jobs.append(fields)
+
+    # A running job sits in one partition, so the column is as wide as the
+    # longest name rather than cut short like the waiting queue's.
+    part_width = max(len("PARTITION"), *(len(job[1]) for job in jobs))
+    line = "{:>10} {:>" + str(part_width) + "} {:>8} {:>11} {:>6} {:>5} {:>11}  {}"
+    out = [line.format("JOBID", "PARTITION", "USER", "TIME", "LIMIT", "GPUS",
+                       "START_TIME", "NODELIST")]
+    total_gpus = 0
+    for jobid, partition, user, used, limit, tres, start, nodes in jobs:
+        gpus = _alloc_gpu_count(tres)
+        total_gpus += gpus
+        out.append(line.format(jobid, partition, user, used, _short_limit(limit),
+                               gpus, _short_stamp(start), nodes))
+    out.append(f"\n{len(jobs)} running jobs, {total_gpus} GPUs")
     return "\n".join(out)
 
 
@@ -3278,6 +3327,10 @@ def main():
     @app.route("/queue")
     def queue():
         return slurm_response(parse_queue_to_table, selected_account(request.args))
+
+    @app.route("/running")
+    def running():
+        return slurm_response(parse_running_to_table, selected_account(request.args))
 
     @app.route("/queue_stats")
     def queue_stats():

@@ -57,8 +57,8 @@
             <option value="{{ account }}">{{ account }}</option>
             {% endfor %}
         </select>
-        <span class="account-hint">allocations, wait estimate, priority and the lab
-            queue all follow this account</span>
+        <span class="account-hint">allocations, wait estimate, priority and the lab's
+            running and waiting jobs all follow this account</span>
     </div>
     <h3><div id="clock"></div></h3>
     <hr>
@@ -141,6 +141,13 @@
 <br>
 
 <hr>
+<details class="section" id="sec-running">
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Running Jobs of <span class="acct-name">uva_cv_lab</span></summary>
+    <pre class='terminal' id="running"> </pre>
+</details>
+<br>
+
+<hr>
 <details class="section" id="sec-queue">
     <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Waiting Queue of <span class="acct-name">uva_cv_lab</span></summary>
     <pre class='terminal' id="queue"> </pre>
@@ -172,6 +179,7 @@
     var disk_quota = document.getElementById("disk_quota");
     var resource = document.getElementById("resource");
     var queue = document.getElementById("queue");
+    var running = document.getElementById("running");
     var queue_stats = document.getElementById("queue_stats");
     var wait_estimate = document.getElementById("wait_estimate");
     var priority = document.getElementById("priority");
@@ -348,6 +356,7 @@
             panelTask("resource info", resource, BASE + "{{ url_for('resource')[1:] }}"),
             panelTask("queue stats", queue_stats, BASE + "{{ url_for('queue_stats')[1:] }}"),
             panelTask("priority ranking", priority, BASE + "{{ url_for('priority')[1:] }}?" + accountParam()),
+            panelTask("running jobs", running, BASE + "{{ url_for('running')[1:] }}?" + accountParam()),
             panelTask("queue info", queue, BASE + "{{ url_for('queue')[1:] }}?" + accountParam()),
             panelTask("the leaderboard", leaderboard, BASE + "{{ url_for('leaderboard')[1:] }}"),
             panelTask("allocations", allocations, BASE + "{{ url_for('allocations')[1:] }}?" + accountParam()),

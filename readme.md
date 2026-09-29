@@ -40,6 +40,7 @@ prints the URL for you. See [Deployment](docs/deployment.md).
 | **Queue Overview** | How contended each GPU type is |
 | **Estimated Wait** | When a job submitted now would start, per GPU pool |
 | **Priority** | Where your account ranks in each pool |
+| **Running Jobs** | Your lab's running jobs and the GPUs they hold |
 | **Waiting Queue** | Your lab's pending jobs |
 
 Pick your account in the header and the account panels follow it.
@@ -62,6 +63,8 @@ python available_resources.py    # only what is free
 
 ## What's new
 
+- **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts
+  jobs that are completing, and now counts jobs that ask for GPUs with `--gpus`.
 - **2026-09-24** Estimated Wait reuses the last start of repeated array tasks and
   searches the earliest part of the 30-day window first, speeding up large queues.
   Waiting Queue shows requested GPUs per job instead of node count.
