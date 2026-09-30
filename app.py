@@ -2312,34 +2312,57 @@ def parse_queue_to_table(account=None):
     PENDING at 0:00. GPUS is the total requested by one job or array task, read
     from its allocated TRES. Both timestamps drop the year to keep the table narrow.
 
+    squeue folds the not yet started tasks of an array into one row; its JOBID
+    carries their range the way squeue prints it, e.g. ``20478034_[155-742%4]``.
+    The last line totals the account's pending jobs and the GPUs they ask for,
+    counting each task of such a row.
+
     The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
     carries no shell syntax.
     """
     account = account or LAB_ACCOUNTS[0]
     columns = (
-        ("JobId", 32), ("Partition", 80), ("UserName", 16), ("TimeLimit", 14),
-        ("tres-alloc", 160), ("SubmitTime", 22), ("StartTime", 22), ("Reason", 120),
+        ("JobId", 32), ("ArrayTaskID", 64), ("Partition", 80), ("UserName", 16),
+        ("TimeLimit", 14), ("tres-alloc", 160), ("SubmitTime", 22), ("StartTime", 22),
+        ("Reason", 120),
     )
     fmt = ",".join(f"{name}:{width}" for name, width in columns)
     rows = parse_cmd(f"squeue -a -h -t PENDING -A {account} -O '{fmt}'")
     if not rows:
         return f"no pending job in {account}"
 
-    line = "{:>10} {:>14} {:>8} {:>6} {:>5} {:>11} {:>11}  {}"
-    out = [line.format("JOBID", "PARTITION", "USER", "LIMIT", "GPUS",
-                       "SUBMIT_TIME", "START_TIME", "NODELIST(REASON)")]
+    jobs = []
     for row in rows:
         fields = []
         pos = 0
         for _, width in columns:
             fields.append(row[pos : pos + width].strip())
             pos += width
-        jobid, partition, user, limit, tres, submit, start, reason = fields
+        jobs.append(fields)
+
+    shown = []
+    total_jobs = total_gpus = 0
+    for jobid, tasks, partition, user, limit, tres, submit, start, reason in jobs:
+        count = 1
+        if tasks not in ("", "N/A"):
+            count, _ = _expand_array_tasks(tasks)
+            if count > 1:
+                jobid = f"{jobid}_[{tasks}]"
+        gpus = _alloc_gpu_count(tres)
+        total_jobs += count
+        total_gpus += count * gpus
+        shown.append((jobid, partition, user, limit, gpus, submit, start, reason))
+
+    id_width = max(10, *(len(job[0]) for job in shown))
+    line = "{:>" + str(id_width) + "} {:>14} {:>8} {:>6} {:>5} {:>11} {:>11}  {}"
+    out = [line.format("JOBID", "PARTITION", "USER", "LIMIT", "GPUS",
+                       "SUBMIT_TIME", "START_TIME", "NODELIST(REASON)")]
+    for jobid, partition, user, limit, gpus, submit, start, reason in shown:
         # A job queued on several partitions lists all of them; cut it to the
         # column like squeue itself would rather than stretching every row.
-        out.append(line.format(jobid, partition[:14], user, _short_limit(limit),
-                               _alloc_gpu_count(tres),
+        out.append(line.format(jobid, partition[:14], user, _short_limit(limit), gpus,
                                _short_stamp(submit), _short_stamp(start), reason))
+    out.append(f"\n{total_jobs} pending jobs, {total_gpus} GPUs")
     return "\n".join(out)
 
 

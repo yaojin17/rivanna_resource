@@ -63,6 +63,8 @@ python available_resources.py    # only what is free
 
 ## What's new
 
+- **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
+  and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts
   jobs that are completing, and now counts jobs that ask for GPUs with `--gpus`.
 - **2026-09-24** Estimated Wait reuses the last start of repeated array tasks and

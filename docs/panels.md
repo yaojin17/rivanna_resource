@@ -106,3 +106,6 @@ nodes. The last line totals the account's running jobs and GPUs.
 Your account's pending jobs with `squeue`'s own columns. `GPUS` is the total number
 of GPUs requested by each job or array task; CPU-only jobs show `0`. `START_TIME` is
 SLURM's own estimate and reads N/A for jobs it has not planned, such as held ones.
+An array's tasks that have not started share one row, whose `JOBID` shows their range
+as `squeue` does (`20478034_[155-742%4]`). The last line totals the account's pending
+jobs and the GPUs they request, counting every task of such a row.
