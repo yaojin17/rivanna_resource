@@ -48,16 +48,32 @@ SLURM_RETRY_DELAY = 1.0
 # to one of the typed partitions as well.
 MONITORED_PARTITIONS = "gpu,gpu-a100-40,gpu-a100-80,gpu-a40,gpu-a6000,gpu-v100,gpu-b200,gpu-rtxpro6000,gpu-mig,gpu-mig-rtxpro6000,interactive,interactive-rtx2080,interactive-rtx3090,dedicated"
 
+
+def _lab_accounts():
+    """RIVANNA_ACCOUNTS as a tuple, refusing anything but plain SLURM account names.
+
+    The names are pasted into shell commands (sshare, sacctmgr, allocations,
+    sbatch), so a malformed one stops the program here instead.
+    """
+    names = tuple(
+        a.strip()
+        for a in os.environ.get("RIVANNA_ACCOUNTS", "uva_cv_lab,cang-lab-in-silico").split(",")
+        if a.strip()
+    )
+    if not names:
+        raise ValueError("RIVANNA_ACCOUNTS names no account")
+    bad = [a for a in names if not re.fullmatch(r"[A-Za-z0-9_.-]+", a)]
+    if bad:
+        raise ValueError(f"RIVANNA_ACCOUNTS: not a valid SLURM account name: {', '.join(map(repr, bad))}")
+    return names
+
+
 # The accounts offered in the page's account picker; the first one is what the
 # page starts on. Everything account-scoped -- the allocation, priority, queue
 # and wait-estimate panels -- follows whichever one is picked, so only accounts
 # we would really submit under belong here.  uva_cv_lab2 is the paid account and
 # is off limits, and dac_cheng has had no allocation since early 2026.
-LAB_ACCOUNTS = tuple(
-    a.strip()
-    for a in os.environ.get("RIVANNA_ACCOUNTS", "uva_cv_lab,cang-lab-in-silico").split(",")
-    if a.strip()
-)
+LAB_ACCOUNTS = _lab_accounts()
 
 
 def is_inaccessible(state: str) -> bool:
@@ -796,7 +812,9 @@ def all_info(color: int, verbose: bool, partition: Optional[str] = None):
     print(f"Under {slurm_str} management")
     print(divider)
     resources = parse_all_gpus(partition=partition)
-    accessible, _, excluded = split_by_access(resources, node_states(partition=partition))
+    accessible, _, excluded = split_by_access(
+        resources, node_states(partition=partition), reserved_for_others()
+    )
     summary_by_type(resources, tag="up")
     print(divider)
     summary_by_type(accessible, tag="accessible")

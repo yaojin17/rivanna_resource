@@ -254,10 +254,8 @@
         jobButton.textContent = "Calculating...";
         try {
             params.set("account", currentAccount());
-            var response = await fetch(BASE + "{{ url_for('wait_estimate')[1:] }}?" + params.toString());
-            wait_estimate.innerHTML = await response.text();
-        } catch (err) {
-            wait_estimate.innerHTML = "<p>Failed to fetch wait estimates: " + err + "</p>";
+            return await loadPanel("wait estimates", wait_estimate,
+                                   BASE + "{{ url_for('wait_estimate')[1:] }}?" + params.toString());
         } finally {
             jobButton.disabled = false;
             jobButton.textContent = "Recalculate";
@@ -279,12 +277,7 @@
     async function updateMyJobs() {
         myJobsFetchedAt = Date.now();
         my_jobs.innerHTML = "<p>Reading the cards...</p>";
-        try {
-            var response = await fetch(BASE + "{{ url_for('my_jobs')[1:] }}");
-            my_jobs.innerHTML = await response.text();
-        } catch (err) {
-            my_jobs.innerHTML = "<p>Failed to read my running jobs: " + err + "</p>";
-        }
+        return loadPanel("my running jobs", my_jobs, BASE + "{{ url_for('my_jobs')[1:] }}");
     }
 
     // A section restored open fires this toggle once the page settles, and the
@@ -297,17 +290,21 @@
     // Every panel is an independent query, so they all go out at once: the page
     // now takes as long as its slowest panel rather than the sum of them all.
     // A panel that fails says so in its own box and the other panels still land.
-    function panelTask(label, target, url) {
-        return function () {
-            return fetch(url)
-                .then(function (response) { return response.text(); })
-                .then(function (t) { target.innerHTML = t; })
-                .catch(function (err) {
-                    console.error("Failed to update " + label + ":", err);
-                    target.innerHTML = "<p>Failed to update " + label + ": " + err + "</p>";
-                    throw err;
-                });
-        };
+    // A panel the server could not build still comes back with a note saying
+    // why, so that note is shown; a request that got no answer at all shows its
+    // error instead. Resolves to whether the panel loaded, which updateAll counts.
+    async function loadPanel(label, target, url) {
+        var response;
+        try {
+            response = await fetch(url);
+            target.innerHTML = await response.text();
+        } catch (err) {
+            console.error("Failed to update " + label + ":", err);
+            target.innerHTML = "<p>Failed to update " + label + ": " + err + "</p>";
+            return false;
+        }
+        if (!response.ok) console.error(label + " answered HTTP " + response.status);
+        return response.ok;
     }
 
     // Tabbing back to the page calls updateAll, so without this a refresh that
@@ -333,10 +330,10 @@
             ["disk quota", "disk_quota", "{{ url_for('disk_quota')[1:] }}", false],
         ].map(function (p) {
             var url = BASE + p[2] + (p[3] ? "?" + accountParam() : "");
-            return panelTask(p[0], document.getElementById(p[1]), url);
+            var target = document.getElementById(p[1]);
+            return function () { return loadPanel(p[0], target, url); };
         });
-        // The wait estimate and my jobs write their own error message, so they
-        // need no wrapper.
+        // These two also manage their button or placeholder around loadPanel.
         tasks.push(updateWaitEstimate);
         if (myJobsSection.open && Date.now() - myJobsFetchedAt > MY_JOBS_MIN_GAP_MS) {
             tasks.push(updateMyJobs);
@@ -353,7 +350,10 @@
                     updateStatus.textContent = "Updating... " + done + "/" + total;
                 });
             }));
-            var failed = results.filter(function (r) { return r.status === "rejected"; }).length;
+            // Every task resolves to whether its panel loaded.
+            var failed = results.filter(function (r) {
+                return r.status === "rejected" || r.value === false;
+            }).length;
             updateStatus.textContent = failed
                 ? "Updated, " + failed + " of " + total + " panels failed"
                 : "Update completed!";

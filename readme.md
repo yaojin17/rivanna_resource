@@ -78,7 +78,13 @@ python available_resources.py    # only what is free
   monitored partitions, `RIVANNA_STANDARD_HOURS` now sets the walltime the form starts
   with, and the app's warnings reach `app.log` as they happen instead of being lost
   on restart. The app no longer needs humanfriendly, and `slurm_gpustat.py -p` on a
-  partition without GPUs reports none instead of the whole cluster's.
+  partition without GPUs reports none instead of the whole cluster's. Queue Overview
+  counts jobs that ask for GPUs with `--gpus` or a bare `--gres=gpu`; when `sacct`
+  fails or cannot be started, Estimated Wait leaves only its Typical column blank
+  instead of failing as a whole; *Update All* counts a panel the server could not
+  build as failed; `slurm_gpustat.py`'s accessible and available summaries leave out
+  nodes reserved for other groups, like the page; and the app refuses to start with a
+  malformed name in `RIVANNA_ACCOUNTS`.
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts

@@ -475,7 +475,6 @@ def parse_queue_stats_to_table():
     actually competes for GPUs is not drowned out by jobs held back by dependencies.
     """
     partition_types = get_partition_gpu_types()
-    gpu_req_pattern = re.compile(r"gres/gpu(?::([^:]+))?:(\d+)")
 
     def _new_bucket():
         return {category: {"jobs": 0, "gpus": 0} for category in QUEUE_CATEGORIES}
@@ -498,17 +497,19 @@ def parse_queue_stats_to_table():
             not_gpu_partition += 1
             continue
 
-        match = gpu_req_pattern.search(job["tres-per-node"])
-        if not match:
+        # tres-alloc holds the whole job's GPUs however they were asked for
+        # (--gres=gpu, a bare one included, --gpus, --gpus-per-task); only the
+        # tres-per-* fields say which type, if any, was named.
+        job_gpus = alloc_gpu_count(job["tres-alloc"])
+        if not job_gpus:
             no_gpu_request += 1
             continue
 
-        req_type = match.group(1)
-        num_nodes = int(job["numnodes"]) if job["numnodes"].isdigit() else 1
+        req_type = _gres_gpu_type(job["tres-per-node"], job["tres-per-job"], job["tres-per-task"])
         # A pending array's tasks share one row, e.g. tasks 0-5,8%2
         tasks = job["arraytaskid"]
         num_tasks = _array_task_count(tasks)
-        total_gpus = int(match.group(2)) * num_nodes * num_tasks
+        total_gpus = job_gpus * num_tasks
 
         candidates = set().union(*(partition_types[p] for p in gpu_parts))
         if req_type:
@@ -684,7 +685,6 @@ STANDARD_JOB_MAX_GPUS = 64
 STANDARD_JOB_MAX_CPUS = 512
 STANDARD_JOB_MAX_MEM_GB = 4096
 STANDARD_JOB_MAX_HOURS = 24 * 14
-ACCOUNT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 # sbatch phrasings that all mean "this account has no node it could ever land on
@@ -741,8 +741,6 @@ def _int_arg(args, name, default, minimum, maximum, allow_auto=False):
 def parse_standard_job_args(args):
     """Turn the web form's query string into validated standard-job settings."""
     account = selected_account(args)
-    if not ACCOUNT_PATTERN.match(account):
-        raise InvalidJobRequest(f"account {account!r} is not a valid SLURM account name")
     return {
         "gpus": _int_arg(args, "gpus", 1, 1, STANDARD_JOB_MAX_GPUS),
         # None means "derive this GPU's even share of the node" per partition.
@@ -1353,17 +1351,14 @@ def _walltime_efficiency():
     limit, which is why its answer is an upper bound. This ratio, measured per
     partition from the last few days of accounting data, is what turns that bound
     into a realistic figure. One sacct call covers every monitored partition, and
-    the result is cached because it barely moves between page refreshes.
+    the result is cached because it barely moves between page refreshes. A failed
+    sacct raises, so it is not cached and the next refresh tries again.
     """
     cmd = (
         f"sacct -a -X -S now-{WALLTIME_SAMPLE_DAYS}days -r {MONITORED_PARTITIONS} "
         "-n -P -o Partition,Elapsed,Timelimit,State,AllocTRES"
     )
-    try:
-        rows = parse_cmd(cmd)
-    except CalledProcessError as exc:
-        print(f"Warning: sacct failed ({exc}); the Typical column will be blank")
-        return {}
+    rows = parse_cmd(cmd)
 
     totals = defaultdict(lambda: {"elapsed": 0, "limit": 0, "jobs": 0})
     # Routine skips, tallied and reported once below.
@@ -1479,8 +1474,14 @@ def parse_wait_estimate_to_table(job):
                 f"<p>Could not work out the priority a job from <b>{job['account']}</b> "
                 "would get, so there is nothing to estimate against.</p>"
             )
-        read = {name: future.result() for name, future in reads.items()}
+        read = {name: future.result() for name, future in reads.items() if name != "efficiency"}
         verdicts = [future.result() for future in verdicts]
+        try:
+            efficiency = reads["efficiency"].result()
+        except (CalledProcessError, OSError) as exc:
+            # Typical only scales the upper bound, which still stands without it.
+            print(f"Warning: sacct failed ({exc}); the Typical column will be blank")
+            efficiency = {}
     pools = read["pools"]
     states = pools["states"]
     total_by_node = pools["total_by_node"]
@@ -1488,7 +1489,6 @@ def parse_wait_estimate_to_table(job):
     part_nodes = read["partition_nodes"]
     shapes = read["shapes"]
     limits = read["limits"]
-    efficiency = read["efficiency"]
     priorities = read["priorities"]
     now = datetime.now()
     default_limit = max(
