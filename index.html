@@ -5,9 +5,6 @@
     <meta charset="utf-8"/>
     <title>Rivanna Monitor</title>
 </head>
-<script src=
-"https://cdnjs.cloudflare.com/ajax/libs/jquery/3.4.0/jquery.min.js">
-    </script>
 <header>
     <h1>Rivanna Monitor: {{ hostname }}</h1>
     <button style="float: right; margin-left: 10px;" onclick="ToggleDarkFn()">Toggle Dark Mode</button>
@@ -31,23 +28,9 @@
             document.body.classList.toggle("dark", themeIsDark());
         }
 
-        function applyThemeStyles() {
-            // 清除所有内联样式，让CSS规则正常工作
-            document.querySelectorAll('table tr, .progress').forEach(function(element) {
-                element.removeAttribute('style');
-            });
-        }
-
-        function checkColour(){
-            applyTheme();
-            // 应用主题样式
-            setTimeout(applyThemeStyles, 100);
-        }
-
         function ToggleDarkFn() {
             localStorage.setItem(THEME_KEY, themeIsDark() ? "light" : "dark");
             applyTheme();
-            applyThemeStyles();
         }
     </script>
     <div class="account-bar">
@@ -64,61 +47,57 @@
     <hr>
 </header>
 
-<body onload="checkColour()">
+<body>
 <!-- Paint the theme as soon as <body> exists, so a dark page does not flash
      white while the rest of the document loads. -->
 <script>applyTheme();</script>
 
 
 <details class="section" id="sec-my_jobs">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> My Running Jobs (live)</summary>
+    <summary> My Running Jobs (live)</summary>
     <div class='table_big' id='my_jobs'> </div>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-resource">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Resource available</summary>
+    <summary> Resource available</summary>
     <div id="resource"> </div>
 </details>
 <br>
 
-<!-- <hr>
-<h2> CPUs available:</h2>
-<div id="cpu_resource"> </div>
-<br> -->
 
 <hr>
 <details class="section" id="sec-leaderboard">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> GPU Leaderboard</summary>
+    <summary> GPU Leaderboard</summary>
     <pre class='terminal' id="leaderboard"> </pre>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-disk_quota">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Disk Quota</summary>
+    <summary> Disk Quota</summary>
     <div class='table_big' id='disk_quota'> </div>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-allocations">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Allocations for <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Allocations for <span class="acct-name">uva_cv_lab</span></summary>
     <div class='table_big' id='allocations'> </div>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-queue_stats">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Queue Overview (All Users)</summary>
+    <summary> Queue Overview (All Users)</summary>
     <div class='table_big' id='queue_stats'> </div>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-wait_estimate">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Estimated Wait for a Standard Job in <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Estimated Wait for a Standard Job in <span class="acct-name">uva_cv_lab</span></summary>
     <form class="job-form" id="jobForm" onsubmit="updateWaitEstimate(); return false;">
         <label>GPUs <input type="text" id="jobGpus" value="1" size="4"></label>
         <label>CPUs <input type="text" id="jobCpus" value="auto" size="5"
@@ -135,21 +114,21 @@
 
 <hr>
 <details class="section" id="sec-priority">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Priority of <span class="acct-name">uva_cv_lab</span> in Each Pool</summary>
+    <summary> Priority of <span class="acct-name">uva_cv_lab</span> in Each Pool</summary>
     <div class='table_big' id='priority'> </div>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-running">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Running Jobs of <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Running Jobs of <span class="acct-name">uva_cv_lab</span></summary>
     <pre class='terminal' id="running"> </pre>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-queue">
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Waiting Queue of <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Waiting Queue of <span class="acct-name">uva_cv_lab</span></summary>
     <pre class='terminal' id="queue"> </pre>
 </details>
 
@@ -315,7 +294,6 @@
         } catch (err) {
             my_jobs.innerHTML = "<p>Failed to read my running jobs: " + err + "</p>";
         }
-        applyThemeStyles();
     }
 
     // A section restored open fires this toggle once the page settles, and the
@@ -383,9 +361,6 @@
             updateStatus.textContent = failed
                 ? "Updated, " + failed + " of " + total + " panels failed"
                 : "Update completed!";
-
-            // 重新应用主题样式
-            setTimeout(applyThemeStyles, 50);
 
             setTimeout(() => updateStatus.textContent = "", 2000);
         } finally {
@@ -657,6 +632,14 @@
 
     body.dark .queue-stats-total {
         border-top: 2px solid #aaa;
+    }
+
+    details.section > summary {
+        cursor: pointer;
+        font-size: 1.5em;
+        font-weight: bold;
+        margin-block-start: 0.83em;
+        margin-block-end: 0.83em;
     }
 
     .mig-details {

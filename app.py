@@ -47,9 +47,19 @@ from slurm_gpustat import (
     parse_cmd,
     avail_stats_for_node,
     parse_node_names,
-    get_gpu_partitions,
     squeue_fields,
+    squeue_jobs,
+    parse_gres_gpus,
+    tres_field,
+    mem_to_mb,
+    alloc_gpu_count,
+    reserved_for_others,
+    aggregate_usage,
+    subtract_usage,
+    format_size,
+    ttl_cache,
     MONITORED_PARTITIONS,
+    LAB_ACCOUNTS,
 )
 
 # from https://developer.nvidia.com/cuda-gpus
@@ -113,6 +123,8 @@ GMEM = {
     "rtx8k": "[48g]",
 }
 OLD_GPU_TYPES = ["p40", "m40"]
+# Memory sizes the leaderboard also totals on their own, as "48g=N".
+LEADERBOARD_GMEM = (48,)
 
 
 def get_resource_bar(avail, total, text="", long=False):
@@ -131,28 +143,6 @@ def get_resource_bar(avail, total, text="", long=False):
     return bar
 
 
-def str_to_int(text):
-    """Convert string with unit to int in GB. e.g. "30 G" --> 30, "1.4 T" --> 1433."""
-    text = text.strip()
-    parts = text.split()
-    if len(parts) != 2:
-        return 0
-    try:
-        number = float(parts[0])
-    except ValueError:
-        print(f"Warning: str_to_int could not parse number from '{text}'")
-        return 0
-    unit = parts[1].upper().rstrip("B")
-    if unit == 'T':
-        return int(number * 1024)
-    elif unit == 'G':
-        return int(number)
-    elif unit == 'M':
-        return int(number / 1024)
-    else:
-        return 0
-
-
 @functools.lru_cache(maxsize=None)
 def display_name(user):
     """Return "Real Name (computing_id)" using the passwd GECOS field."""
@@ -168,7 +158,7 @@ def display_name(user):
     return f"{name} ({user})"
 
 
-def _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner):
+def _leaderboard_row(user, subdict, name_width, owner):
     """One leaderboard line; the row of the account running this app is marked."""
     total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
     user_summary = [
@@ -182,7 +172,7 @@ def _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner):
     num_new_gpus = [
         val for key, val in subdict["n_gpu"].items() if key not in OLD_GPU_TYPES
     ]
-    for gm in sum_by_gmem:
+    for gm in LEADERBOARD_GMEM:
         total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
     total += f"|newer={str(sum(num_new_gpus)):2s}"
     total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
@@ -192,211 +182,13 @@ def _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner):
     return f"  {line}\n"
 
 
-def parse_leaderboard(sum_by_gmem=[48]):
-    """Request sinfo, parse the leaderboard in string."""
-
-    resources = parse_all_gpus()
-    usage = gpu_usage(
-        resources=resources,
-    )  # partition='gpu'
-    aggregates = {}
-    for user, subdict in usage.items():
-        aggregates[user] = {}
-        aggregates[user]["n_gpu"] = {
-            key: sum([x["n_gpu"] for x in val.values()]) for key, val in subdict.items()
-        }
-        aggregates[user]["bash_gpu"] = {
-            key: sum([x["bash_gpu"] for x in val.values()])
-            for key, val in subdict.items()
-        }
-    out = ""
+def parse_leaderboard():
+    """GPUs held by each user across the monitored partitions, most GPUs first."""
+    aggregates = aggregate_usage(gpu_usage(resources=parse_all_gpus()))
     owner = _app_owner()
     name_width = max((len(display_name(u)) for u in aggregates), default=12) + 2
-    for user, subdict in sorted(
-        aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
-    ):
-        out += _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner)
-    return out
-
-
-def parse_leaderboard_by_partition(sum_by_gmem=[48]):
-    """Request sinfo, parse the leaderboard in string."""
-    resources = parse_all_gpus()
-    gpu_partitions = get_gpu_partitions()
-
-    owner = _app_owner()
-    out = "=" * 64 + "\n"
-    for i, part in enumerate(gpu_partitions):
-        usage = gpu_usage(resources=resources, partition=part)  # partition='gpu'
-        aggregates = {}
-        for user, subdict in usage.items():
-            aggregates[user] = {}
-            aggregates[user]["n_gpu"] = {
-                key: sum([x["n_gpu"] for x in val.values()])
-                for key, val in subdict.items()
-            }
-            aggregates[user]["bash_gpu"] = {
-                key: sum([x["bash_gpu"] for x in val.values()])
-                for key, val in subdict.items()
-            }
-        if i != 0:
-            out += "-" * 64 + "\n"
-        out += f"PARTITION: {part}\n"
-        name_width = max((len(display_name(u)) for u in aggregates), default=12) + 2
-        for user, subdict in sorted(
-            aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
-        ):
-            out += _leaderboard_row(user, subdict, name_width, sum_by_gmem, owner)
-    out += "=" * 64 + "\n"
-    return out
-
-
-def cpu_usage(resources, partition="compute"):
-    """Build a data structure of the CPU resource usage, organised by user.
-
-    Args:
-        resources (dict :: None): a summary of cluster resources, organised by node name.
-
-    Returns:
-        (dict): a summary of resources organised by user (and also by node name).
-    """
-    # RUNNING only, as in gpu_usage: a COMPLETING job has already released its node
-    cmd = "squeue -a -t RUNNING -O NumNodes:100,nodelist:100,username:100,jobid:100 --noheader"
-    if partition:
-        cmd += f" --partition={partition}"
-    rows = parse_cmd(cmd)
-    usage = defaultdict(dict)
-    for row in rows:
-        tokens = row.split()
-        if len(tokens) < 4:
-            print(f"Warning: unexpected squeue row {row!r}, skipping")
-            continue
-        cpu_count_str, node_str, user, jobid = tokens
-        num_cpus = int(cpu_count_str.strip())
-        node_names = parse_node_names(node_str)
-        for node_name in node_names:
-            # If a node still has jobs running but is draining, it will not be present
-            # in the "available" resources, so we ignore it
-            if node_name not in resources:
-                continue
-            cpu_type = resources[node_name]["type"]
-
-            if cpu_type in usage[user]:
-                usage[user][cpu_type][node_name]["n_cpu"] += num_cpus
-            else:
-                usage[user][cpu_type] = defaultdict(
-                    lambda: {
-                        "n_cpu": 0,
-                    }
-                )
-                usage[user][cpu_type][node_name]["n_cpu"] += num_cpus
-    return usage
-
-
-def parse_cpu_usage_to_table(partition="compute", show_bar=True):
-    """Request sinfo for cnode, parse the output to a html table."""
-
-    node_str = parse_cmd(f"sinfo -o '%1000N' --noheader --partition={partition}")
-    assert isinstance(node_str, list) and len(node_str) == 1
-    node_names = parse_node_names(node_str[0].strip())
-    resources = {k: {"type": k[0:6] + "xx", "count": 1} for k in node_names}
-    states = node_states(partition=partition)
-    res = {
-        key: val
-        for key, val in resources.items()
-        if not is_inaccessible(states.get(key, "down"))
-    }
-    res_total = copy.deepcopy(res)
-    usage = cpu_usage(resources=res, partition=partition)
-
-    for subdict in usage.values():
-        for cpu_type, node_dicts in subdict.items():
-            for node_name, user_cpu_count in node_dicts.items():
-                count = res[node_name]["count"]
-                count = max(count - user_cpu_count["n_cpu"], 0)
-                res[node_name]["count"] = count
-
-    res_total_by_type = defaultdict(list)
-    for node, spec in res_total.items():
-        res_total_by_type[spec["type"]].append({"node": node, "count": spec["count"]})
-
-    res_usage_by_type = defaultdict(list)
-    for node, spec in res.items():
-        res_usage_by_type[spec["type"]].append({"node": node, "count": spec["count"]})
-
-    table_html = []
-    total_cpu_count = 0
-    avail_cpu_count = 0
-
-    # sort cpus from new to old
-    type_list = sorted(list(res_total_by_type.keys()), reverse=True)
-
-    # writing the html table
-    for cpu_type in type_list:
-        node_dicts = res_total_by_type[cpu_type]
-        node_names = sorted([i["node"] for i in node_dicts])
-
-        node_summaries = []
-        num_col = []
-
-        for node in node_names:
-            node_name = f"<td>{node}</td>"
-
-            users = [user for user in usage if node in usage[user].get(cpu_type, [])]
-            if len(users):
-                users = f"<td>user: {','.join(users)}</td>"
-            else:
-                users = f"<td>&nbsp</td>"
-
-            detail_dict = avail_stats_for_node(node)
-            detail_dict = {k: v for k, v in detail_dict.items() if k in ["cpu", "mem"]}
-
-            if show_bar:
-                c_stat = detail_dict["cpu"].split("/")
-                c_stat = [int(i.strip()) for i in c_stat]
-                cpu_bar = get_resource_bar(*c_stat, text=detail_dict["cpu"])
-
-                m_stat = detail_dict["mem"].split("/")
-                m_stat = [str_to_int(i.strip()) for i in m_stat]
-                mem_bar = get_resource_bar(*m_stat, text=detail_dict["mem"], long=True)
-
-                total_cpu_count += c_stat[-1]
-                avail_cpu_count += c_stat[-1] - c_stat[0]
-            else:
-                cpu_bar = detail_dict["cpu"]
-                mem_bar = detail_dict["mem"]
-            cpu_stat = f"<td>cpu: {cpu_bar}</td>"
-            mem_stat = f"<td>mem: {mem_bar}</td>"
-
-            node_summary = (
-                f"<tr><td>&nbsp</td>{node_name}{cpu_stat}{mem_stat}{users}</tr>"
-            )
-            node_summaries.append(node_summary)
-            num_col.append(5)
-
-        type_summary = (
-            f'<tr><td colspan="{max(num_col)}"><b>' f"{cpu_type}: </b></td></tr>"
-        )
-        table_html.append(type_summary)
-        table_html.extend(node_summaries)
-
-    if show_bar:
-        total_bar = get_resource_bar(
-            avail_cpu_count,
-            total_cpu_count,
-            text=f"{avail_cpu_count} / {total_cpu_count}",
-        )
-        total_summary = (
-            f'<tr><td colspan="{max(num_col)}"><h3>'
-            f"Summary: {total_bar} cpus available</h3></td></tr>"
-        )
-    else:
-        total_bar = f"{avail_cpu_count}/{total_cpu_count}"
-        total_summary = ""
-
-    table_html = f"<table>{total_summary}{''.join(table_html)}</table>"
-
-    return table_html
+    ranked = sorted(aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True)
+    return "".join(_leaderboard_row(user, subdict, name_width, owner) for user, subdict in ranked)
 
 
 def _state_badge(state):
@@ -411,18 +203,6 @@ def _state_badge(state):
     else:
         cls = "state-idle"
     return f'<span class="state-badge {cls}">{state}</span>'
-
-
-# The accounts offered in the page's account picker; the first one is what the
-# page starts on. Everything account-scoped -- the allocation, priority, queue
-# and wait-estimate panels -- follows whichever one is picked, so only accounts
-# we would really submit under belong here.  uva_cv_lab2 is the paid account and
-# is off limits, and dac_cheng has had no allocation since early 2026.
-LAB_ACCOUNTS = tuple(
-    a.strip()
-    for a in os.environ.get("RIVANNA_ACCOUNTS", "uva_cv_lab,cang-lab-in-silico").split(",")
-    if a.strip()
-)
 
 
 def selected_account(args):
@@ -441,43 +221,6 @@ def selected_account(args):
     return wanted
 
 
-def _reserved_for_others():
-    """Nodes held by an active reservation that none of LAB_ACCOUNTS may use.
-
-    sinfo only reports a reserved node as ``resv`` while it is idle; once any job
-    runs on it the state reads plain ``mix``, so without this a node like
-    udc-ba07-38 (reservation dac_ssz, one CPU in use, eight idle A40s) looks
-    wide open. Returns ``{node: reservation name}``.
-
-    Access is judged by account only. A reservation granted to users or groups
-    (maintenance windows held for root, say) is treated as closed, and
-    ``Accounts=-name`` is SLURM's "everyone except" form.
-    """
-    locked = {}
-    for row in parse_cmd("scontrol show reservation -o"):
-        fields = dict(
-            token.split("=", 1) for token in row.split() if "=" in token
-        )
-        name = fields.get("ReservationName", "?")
-        if fields.get("State") != "ACTIVE":
-            continue
-        nodes = fields.get("Nodes", "(null)")
-        if nodes in ("", "(null)"):
-            print(f"Warning: active reservation {name} names no nodes, ignoring it")
-            continue
-        accounts = fields.get("Accounts", "(null)")
-        listed = set() if accounts == "(null)" else set(accounts.lstrip("-").split(","))
-        if accounts.startswith("-"):
-            ours = not (listed & set(LAB_ACCOUNTS))
-        else:
-            ours = bool(listed & set(LAB_ACCOUNTS))
-        if ours:
-            continue
-        for node in parse_node_names(nodes):
-            # A node in two closed reservations just keeps the first name.
-            locked.setdefault(node, name)
-    return locked
-
 def _is_mig_type(gpu_type):
     """MIG slice types are named after their memory share, e.g. "1g.10gb"."""
     return gpu_type[0].isdigit() if gpu_type else False
@@ -495,7 +238,7 @@ def _gpu_pools():
     resources = parse_all_gpus(partition=MONITORED_PARTITIONS)
     states = node_states(partition=MONITORED_PARTITIONS)
     reserved = {
-        node: name for node, name in _reserved_for_others().items() if node in resources
+        node: name for node, name in reserved_for_others().items() if node in resources
     }
     # Reserved for somebody else is as good as down for us, whatever sinfo says.
     for node in reserved:
@@ -515,14 +258,7 @@ def _gpu_pools():
 
     res_total = copy.deepcopy(res_accessible)
     usage = gpu_usage(resources=res_accessible)
-
-    for subdict in usage.values():
-        for gpu_type, node_dicts in subdict.items():
-            for node_name, user_gpu_count in node_dicts.items():
-                resource_idx = [x["type"] for x in res_accessible[node_name]].index(gpu_type)
-                count = res_accessible[node_name][resource_idx]["count"]
-                count = max(count - user_gpu_count["n_gpu"], 0)
-                res_accessible[node_name][resource_idx]["count"] = count
+    subtract_usage(res_accessible, usage)
 
     return {
         "states": states,
@@ -537,7 +273,7 @@ def _gpu_pools():
     }
 
 
-def parse_usage_to_table(show_bar=True):
+def parse_usage_to_table():
     """Request sinfo, parse the output to a html table."""
 
     pools = _gpu_pools()
@@ -566,7 +302,6 @@ def parse_usage_to_table(show_bar=True):
         rows_html = []
         total_count = 0
         avail_count = 0
-        num_col = [7]
         for gpu_type in type_list_to_render:
             node_dicts = res_total_by_type.get(gpu_type, [])
             down_node_dicts = res_down_by_type.get(gpu_type, [])
@@ -582,36 +317,27 @@ def parse_usage_to_table(show_bar=True):
                 node_state = states.get(node, "unknown")
                 state_html = f"<td>{_state_badge(node_state)}</td>"
                 node_name_td = f"<td>{node}</td>"
-                if show_bar:
-                    gpu_bar = get_resource_bar(
-                        gpu_count_avail.get(node, 0),
-                        gpu_count_total[node],
-                        text=f"{gpu_count_avail.get(node, 0)} / {gpu_count_total[node]}",
-                    )
-                else:
-                    gpu_bar = f"{gpu_count_avail.get(node, 0)}/{gpu_count_total[node]}"
+                gpu_bar = get_resource_bar(
+                    gpu_count_avail.get(node, 0),
+                    gpu_count_total[node],
+                    text=f"{gpu_count_avail.get(node, 0)} / {gpu_count_total[node]}",
+                )
                 gpu_stat = f"<td>gpu: {gpu_bar}</td>"
 
                 users_list = [user for user in usage if node in usage[user].get(gpu_type, [])]
                 if len(users_list):
                     users_td = f"<td>user: {','.join(users_list)}</td>"
                 else:
-                    users_td = f"<td>&nbsp</td>"
+                    users_td = "<td>&nbsp</td>"
 
-                detail_dict = avail_stats_for_node(node)
-                detail_dict = {k: v for k, v in detail_dict.items() if k in ["cpu", "mem"]}
-
-                if show_bar:
-                    c_stat = detail_dict["cpu"].split("/")
-                    c_stat = [int(i.strip()) for i in c_stat]
-                    cpu_bar = get_resource_bar(*c_stat, text=detail_dict["cpu"])
-
-                    m_stat = detail_dict["mem"].split("/")
-                    m_stat = [str_to_int(i.strip()) for i in m_stat]
-                    mem_bar = get_resource_bar(*m_stat, text=detail_dict["mem"], long=True)
-                else:
-                    cpu_bar = detail_dict["cpu"]
-                    mem_bar = detail_dict["mem"]
+                stats = avail_stats_for_node(node)
+                cpu_free, cpu_total = stats["cpu"]
+                cpu_bar = get_resource_bar(cpu_free, cpu_total, text=f"{cpu_free} / {cpu_total}")
+                mem_free, mem_total = stats["mem"]
+                mem_bar = get_resource_bar(
+                    mem_free // 1024**3, mem_total // 1024**3,
+                    text=f"{format_size(mem_free)} / {format_size(mem_total)}", long=True,
+                )
                 cpu_stat = f"<td>cpu: {cpu_bar}</td>"
                 mem_stat = f"<td>mem: {mem_bar}</td>"
 
@@ -635,10 +361,7 @@ def parse_usage_to_table(show_bar=True):
 
             type_total = sum(gpu_count_total.values())
             type_avail = sum(gpu_count_avail.values())
-            if show_bar:
-                type_bar = get_resource_bar(type_avail, type_total, text=f"{type_avail} / {type_total}")
-            else:
-                type_bar = f"{type_avail}/{type_total}"
+            type_bar = get_resource_bar(type_avail, type_total, text=f"{type_avail} / {type_total}")
 
             down_note = _down_note(down_node_dicts)
 
@@ -656,20 +379,14 @@ def parse_usage_to_table(show_bar=True):
     gpu_rows, gpu_avail, gpu_total, gpu_down = _render_type_rows(gpu_type_list)
     mig_rows, mig_avail, mig_total, mig_down = _render_type_rows(mig_type_list)
 
-    if show_bar:
-        total_bar = get_resource_bar(gpu_avail, gpu_total, text=f"{gpu_avail} / {gpu_total}")
-    else:
-        total_bar = f"{gpu_avail}/{gpu_total}"
+    total_bar = get_resource_bar(gpu_avail, gpu_total, text=f"{gpu_avail} / {gpu_total}")
     down_note = _down_note(gpu_down)
     total_summary = f'<tr><td colspan="7"><h3>Summary: {total_bar} gpus available{down_note}</h3></td></tr>'
 
     table_html = f"<table>{total_summary}{gpu_rows}</table>"
 
     if mig_type_list:
-        if show_bar:
-            mig_bar = get_resource_bar(mig_avail, mig_total, text=f"{mig_avail} / {mig_total}")
-        else:
-            mig_bar = f"{mig_avail}/{mig_total}"
+        mig_bar = get_resource_bar(mig_avail, mig_total, text=f"{mig_avail} / {mig_total}")
         mig_down_note = _down_note(mig_down)
         table_html += (
             f'<details class="mig-details"><summary>MIG: {mig_bar} slices available{mig_down_note}</summary>'
@@ -677,33 +394,6 @@ def parse_usage_to_table(show_bar=True):
         )
 
     return table_html
-
-
-def _count_array_tasks(jobid_str):
-    """Count the number of tasks in a job array ID like '123_[0-5,8,10-12]'."""
-    if "_[" not in jobid_str:
-        return 1
-    if "]" not in jobid_str:
-        return 1
-    bracket = jobid_str[jobid_str.index("[") + 1 : jobid_str.index("]")]
-    bracket = bracket.split("%")[0]
-    count = 0
-    for part in bracket.split(","):
-        if "-" in part:
-            tokens = part.split("-", 1)
-            if tokens[0].isdigit() and tokens[1].isdigit():
-                count += int(tokens[1]) - int(tokens[0]) + 1
-            else:
-                count += 1
-        else:
-            count += 1
-    return count
-
-
-def _is_gpu_partition(partition_name):
-    """Check if a partition name is GPU-related."""
-    keywords = ("gpu", "interactive", "dedicated")
-    return any(kw in partition_name.lower() for kw in keywords)
 
 
 # Pending reasons meaning the job is genuinely queued for GPUs right now.
@@ -764,9 +454,7 @@ def _classify_pending_reason(reason):
 
 def get_partition_gpu_types():
     """Map every partition to the set of GPU types its nodes provide."""
-    rows = parse_cmd("sinfo -a -o '%5000P|%5000G' --noheader")
-    # Same shape as the gres string parsed in slurm_gpustat.parse_all_gpus.
-    gres_pattern = re.compile(r"gpu:(?:([^:]*):)?(\d*)(?:\(\S*\))?")
+    rows = parse_cmd("sinfo -a -o '%P|%G' --noheader")
     partition_types = defaultdict(set)
     for row in rows:
         tokens = row.split("|")
@@ -775,14 +463,8 @@ def get_partition_gpu_types():
             continue
         # sinfo marks the default partition with a trailing '*'
         partition = tokens[0].strip().rstrip("*")
-        for entry in tokens[1].strip().split(","):
-            if not entry.startswith("gpu"):
-                continue
-            match = gres_pattern.search(entry)
-            if not match:
-                print(f"Warning: could not parse gres {entry!r} of partition {partition}, skipping")
-                continue
-            partition_types[partition].add(match.group(1) or "NONAME_GPU")
+        for gpu_type, _ in parse_gres_gpus(tokens[1]):
+            partition_types[partition].add(gpu_type or "NONAME_GPU")
     return partition_types
 
 
@@ -798,7 +480,6 @@ def parse_queue_stats_to_table():
     """
     partition_types = get_partition_gpu_types()
     gpu_req_pattern = re.compile(r"gres/gpu(?::([^:]+))?:(\d+)")
-    rows = parse_cmd("squeue -a -t PENDING --noheader -o '%i|%P|%b|%D|%r'")
 
     def _new_bucket():
         return {category: {"jobs": 0, "gpus": 0} for category in QUEUE_CATEGORIES}
@@ -808,36 +489,32 @@ def parse_queue_stats_to_table():
     totals = _new_bucket()
     # {partition_group: {"jobs": N, "gpus": N, "types": {type: count}}}
     group_stats = defaultdict(lambda: {"jobs": 0, "gpus": 0, "types": defaultdict(int)})
-    unknown_partitions = set()
     impossible_requests = set()
+    # Routine skips, tallied and reported once below.
+    not_gpu_partition = no_gpu_request = 0
 
-    for row in rows:
-        fields = row.strip().split("|", 4)
-        if len(fields) < 5:
-            print(f"Warning: unexpected squeue row {row!r}, skipping")
-            continue
-        jobid, partitions, tres, num_nodes_str, reason = fields
-
-        partition_list = [p.strip() for p in partitions.split(",")]
-        gpu_parts = [p for p in partition_list if _is_gpu_partition(p)]
+    for job in squeue_jobs("PENDING"):
+        partition_list = [p.strip() for p in job["partition"].split(",")]
+        # A GPU partition is one whose nodes have GPUs, so every partition kept here
+        # contributes at least one candidate type below.
+        gpu_parts = [p for p in partition_list if p in partition_types]
         if not gpu_parts:
+            not_gpu_partition += 1
             continue
 
-        match = gpu_req_pattern.search(tres)
+        match = gpu_req_pattern.search(job["tres-per-node"])
         if not match:
+            no_gpu_request += 1
             continue
 
         req_type = match.group(1)
-        num_nodes = int(num_nodes_str.strip()) if num_nodes_str.strip().isdigit() else 1
-        num_tasks = _count_array_tasks(jobid)
+        num_nodes = int(job["numnodes"]) if job["numnodes"].isdigit() else 1
+        # A pending array's tasks share one row, e.g. tasks 0-5,8%2
+        tasks = job["arraytaskid"]
+        num_tasks = _expand_array_tasks(tasks)[0] if tasks not in ("", "N/A") else 1
         total_gpus = int(match.group(2)) * num_nodes * num_tasks
 
-        candidates = set()
-        for partition in gpu_parts:
-            if partition not in partition_types:
-                unknown_partitions.add(partition)
-                continue
-            candidates |= partition_types[partition]
+        candidates = set().union(*(partition_types[p] for p in gpu_parts))
         if req_type:
             narrowed = {t for t in candidates if t == req_type}
             if not narrowed:
@@ -846,14 +523,8 @@ def parse_queue_stats_to_table():
                 impossible_requests.add((", ".join(sorted(gpu_parts)), req_type))
                 narrowed = {req_type}
             candidates = narrowed
-        if not candidates:
-            print(
-                f"Warning: pending job {jobid} asks for GPUs in {gpu_parts} but no GPU "
-                "type could be resolved, skipping"
-            )
-            continue
 
-        category = _classify_pending_reason(reason)
+        category = _classify_pending_reason(job["reason"])
         totals[category]["jobs"] += num_tasks
         totals[category]["gpus"] += total_gpus
 
@@ -867,11 +538,9 @@ def parse_queue_stats_to_table():
         group_stats[group_key]["gpus"] += total_gpus
         group_stats[group_key]["types"][req_type if req_type else "any"] += total_gpus
 
-    if unknown_partitions:
-        print(
-            f"Warning: no GPU inventory found for partition(s) {sorted(unknown_partitions)}; "
-            "pending jobs there were resolved from their other partitions only"
-        )
+    if not_gpu_partition or no_gpu_request:
+        print(f"Note: queue overview skipped {not_gpu_partition} pending jobs outside the GPU "
+              f"partitions and {no_gpu_request} that ask for no GPU")
     for group, req_type in sorted(impossible_requests):
         print(
             f"Warning: pending jobs ask for gpu type {req_type!r} in partition(s) "
@@ -1048,7 +717,8 @@ _reported_no_access = set()
 # a type is drained, so the verdict is kept briefly rather than for the life of
 # the process, and a pool that comes back is picked up within the TTL.
 TEST_ONLY_CACHE_SECONDS = int(os.environ.get("RIVANNA_TEST_ONLY_TTL", "60"))
-_test_only_cache = {}
+# Threads the wait estimate runs its SLURM reads and test-only checks on.
+WAIT_ESTIMATE_WORKERS = 4
 # Union partitions already reported as skipped, for the same reason.
 _reported_unions = set()
 
@@ -1158,7 +828,6 @@ def _standard_job_specs(job):
     why those two are resolved per partition rather than once up front.
     """
     rows = parse_cmd(f"sinfo -h -p {MONITORED_PARTITIONS} -o '%P|%c|%m|%G'")
-    gres_pattern = re.compile(r"gpu:(?:([^:]*):)?(\d+)")
     # partition -> gpu type -> densest (cpus, mem, gpus) node shape offering it
     by_partition = defaultdict(dict)
     for row in rows:
@@ -1173,15 +842,11 @@ def _standard_job_specs(job):
         if not cpu_str.isdigit() or not mem_str.isdigit():
             print(f"Warning: unparsable cpu/mem {cpu_str!r}/{mem_str!r} in {partition}, skipping")
             continue
-        for entry in tokens[3].strip().split(","):
-            if not entry.startswith("gpu"):
+        for gpu_type, n_gpu in parse_gres_gpus(tokens[3]):
+            gpu_type = gpu_type or "NONAME_GPU"
+            if n_gpu is None:
+                print(f"Warning: partition {partition} gives no {gpu_type} gpu count, skipping")
                 continue
-            match = gres_pattern.search(entry)
-            if not match:
-                print(f"Warning: could not parse gres {entry!r} of partition {partition}, skipping")
-                continue
-            gpu_type = match.group(1) or "NONAME_GPU"
-            n_gpu = int(match.group(2))
             if n_gpu == 0:
                 print(f"Warning: partition {partition} reports 0 {gpu_type} gpus, skipping")
                 continue
@@ -1254,22 +919,22 @@ def _test_only_check(spec, account):
     instead. Returns None when the job is admissible, else a
     ``("no_access" | "error", reason)`` tuple.
     """
-    # Every interpolated field is validated in parse_standard_job_args or read
-    # straight out of sinfo, so none of them can carry shell syntax.
-    cmd = (
-        f"sbatch --test-only -A {account} -p {spec['partition']} "
-        f"--gres=gpu:{spec['gpu_type']}:{spec['gpus']} -c {spec['cpus']} "
-        f"--mem={spec['mem_mb']}M -t {spec['minutes']} --wrap=hostname"
-    )
-    key = (
+    return _test_only_verdict(
         account, spec["partition"], spec["gpu_type"],
         spec["gpus"], spec["cpus"], spec["mem_mb"], spec["minutes"],
     )
-    now = time.monotonic()
-    cached = _test_only_cache.get(key)
-    if cached is not None and now - cached[0] < TEST_ONLY_CACHE_SECONDS:
-        return cached[1]
 
+
+@ttl_cache(TEST_ONLY_CACHE_SECONDS)
+def _test_only_verdict(account, partition, gpu_type, gpus, cpus, mem_mb, minutes):
+    """The cached ``sbatch --test-only`` behind :func:`_test_only_check`."""
+    # Every interpolated field is validated in parse_standard_job_args or read
+    # straight out of sinfo, so none of them can carry shell syntax.
+    cmd = (
+        f"sbatch --test-only -A {account} -p {partition} "
+        f"--gres=gpu:{gpu_type}:{gpus} -c {cpus} "
+        f"--mem={mem_mb}M -t {minutes} --wrap=hostname"
+    )
     try:
         out = check_output(cmd, shell=True, stderr=STDOUT).decode("utf-8")
     except CalledProcessError as exc:
@@ -1279,76 +944,28 @@ def _test_only_check(spec, account):
     else:
         lines = out.strip().splitlines()
         reason = lines[-1].replace("sbatch: error: ", "") if lines else "no output"
-        pool = (spec["partition"], spec["gpu_type"])
+        pool = (partition, gpu_type)
         if any(marker in reason for marker in NO_ACCESS_MARKERS):
             if pool not in _reported_no_access:
                 _reported_no_access.add(pool)
                 print(
-                    f"Note: {account} has no schedulable node for {spec['gpu_type']} in "
-                    f"{spec['partition']} ({reason}); leaving that pool out of the estimates"
+                    f"Note: {account} has no schedulable node for {gpu_type} in "
+                    f"{partition} ({reason}); leaving that pool out of the estimates"
                 )
             verdict = ("no_access", reason)
         else:
-            print(f"Warning: {spec['gpu_type']} on {spec['partition']} rejects this job shape: {reason}")
+            print(f"Warning: {gpu_type} on {partition} rejects this job shape: {reason}")
             verdict = ("error", reason)
-    _test_only_cache[key] = (now, verdict)
     return verdict
 
 
 # ------------------------------------------------------------ queue snapshot
-# Read in full through squeue_fields: a fixed width would cut long node lists,
-# array specs and partition lists short.
-QUEUE_FORMAT = (
-    "jobid",
-    "arrayjobid",
-    "arraytaskid",
-    "prioritylong",
-    "partition",
-    "account",
-    "state",
-    "endtime",
-    "nodelist",
-    "numnodes",
-    "timelimit",
-    "tres-per-node",
-    "tres-per-job",
-    "tres-per-task",
-    "tres-alloc",
-    "reason",
-)
 # Arrays with more pending tasks than this are cut down, with a warning: the
 # simulation would otherwise spend its time on a queue that cannot run anyway.
 ARRAY_TASK_CAP = 2000
 # Resolution and reach of the queue replay, see _plan_pool.
 PLAN_MINUTES = 10
 PLAN_HORIZON_DAYS = 30
-
-
-def _squeue_rows(extra_args):
-    """Run squeue with QUEUE_FORMAT and return one dict per job."""
-    entries = []
-    for entry in squeue_fields(f"-a -h {extra_args}", QUEUE_FORMAT):
-        if not entry["jobid"]:
-            print(f"Warning: squeue row without a job id {entry!r}, skipping")
-            continue
-        entries.append(entry)
-    return entries
-
-
-def _tres_field(tres, name):
-    """Value of ``name`` in a TRES string like ``cpu=8,mem=64G,gres/gpu=2``."""
-    match = re.search(rf"(?:^|,){re.escape(name)}=([^,]+)", tres)
-    return match.group(1) if match else None
-
-
-def _mem_to_mb(text):
-    """``48G`` / ``4000000M`` / ``7812.50G`` / ``2T`` to megabytes."""
-    match = re.fullmatch(r"([0-9.]+)([KMGT]?)", text.strip())
-    if not match:
-        return None
-    value = float(match.group(1))
-    scale = {"": 1, "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}[match.group(2)]
-    return int(value * scale)
 
 
 def _gres_gpu_type(*tres_strings):
@@ -1390,6 +1007,22 @@ def _expand_array_tasks(task_spec):
     return count, throttle
 
 
+def _sprio_rows():
+    """``(jobid, partition, total, partition factor)`` strings, one per sprio row.
+
+    One query feeds both the wait estimate and the priority panel, so a refresh
+    asks sprio once. Each caller checks the numbers it uses.
+    """
+    rows = []
+    for row in parse_cmd("sprio -h -o '%i|%r|%Y|%P'"):
+        fields = [f.strip() for f in row.split("|")]
+        if len(fields) < 4:
+            print(f"Warning: unexpected sprio row {row!r}, skipping")
+            continue
+        rows.append(tuple(fields[:4]))
+    return rows
+
+
 def _sprio_by_job():
     """jobid -> {partition: total priority} for every job SLURM is ranking.
 
@@ -1398,14 +1031,9 @@ def _sprio_by_job():
     which is exactly the set of jobs not competing for a node right now.
     """
     priorities = defaultdict(dict)
-    for row in parse_cmd("sprio -h -o '%i|%r|%Y'"):
-        fields = row.split("|")
-        if len(fields) < 3:
-            print(f"Warning: unexpected sprio row {row!r}, skipping")
-            continue
-        jobid, partition, total = (f.strip() for f in fields[:3])
+    for jobid, partition, total, _ in _sprio_rows():
         if not total.isdigit():
-            print(f"Warning: unparsable sprio priority in {row!r}, skipping")
+            print(f"Warning: unparsable sprio priority {total!r} for job {jobid}, skipping")
             continue
         priorities[jobid][partition] = int(total)
     return priorities
@@ -1459,6 +1087,29 @@ def _first_int(text):
     return int(match.group(0)) if match else None
 
 
+def _row_alloc(row, max_minutes, what):
+    """Whole-job GPUs, CPUs, memory (MB) and time limit of one squeue row.
+
+    ``what`` is how warnings name the job ("job", "pending job"). The time limit
+    falls back to ``max_minutes`` when squeue gives none.
+    """
+    tres = row["tres-alloc"]
+    cpus = tres_field(tres, "cpu")
+    mem = tres_field(tres, "mem")
+    mem_mb = mem_to_mb(mem) if mem else 0
+    if mem and mem_mb is None:
+        print(f"Warning: unparsable memory {mem!r} for {what} {row['jobid']}, counting 0")
+        mem_mb = 0
+    limit = _slurm_time_to_minutes(row["timelimit"])
+    return {
+        "gpus": alloc_gpu_count(tres),
+        "cpus": int(cpus) if cpus and cpus.isdigit() else 0,
+        "mem_mb": mem_mb,
+        "minutes": max_minutes if limit is None else limit,
+        "array": row["arrayjobid"] if row["arrayjobid"] not in ("", "N/A") else None,
+    }
+
+
 def _running_jobs_by_node(rows, now, max_minutes):
     """node -> list of running allocations on it, from squeue rows.
 
@@ -1468,17 +1119,13 @@ def _running_jobs_by_node(rows, now, max_minutes):
     """
     by_node = defaultdict(list)
     for row in rows:
-        gpus = _tres_field(row["tres-alloc"], "gres/gpu")
-        cpus = _tres_field(row["tres-alloc"], "cpu")
-        mem = _tres_field(row["tres-alloc"], "mem")
         nodes = parse_node_names(row["nodelist"]) if row["nodelist"] else []
         if not nodes:
             print(f"Warning: running job {row['jobid']} has no node list, skipping")
             continue
         n_nodes = len(nodes)
-        limit = _slurm_time_to_minutes(row["timelimit"])
-        if limit is None:
-            limit = max_minutes
+        held = _row_alloc(row, max_minutes, "job")
+        limit = held["minutes"]
         if row["endtime"] in ("N/A", "UNKNOWN", ""):
             print(f"Warning: running job {row['jobid']} has no end time, assuming its full limit")
             end = now + timedelta(minutes=limit)
@@ -1488,19 +1135,15 @@ def _running_jobs_by_node(rows, now, max_minutes):
             except ValueError as err:
                 print(f"Warning: unparsable end time for job {row['jobid']}: {err}, assuming its limit")
                 end = now + timedelta(minutes=limit)
-        mem_mb = _mem_to_mb(mem) if mem else 0
-        if mem and mem_mb is None:
-            print(f"Warning: unparsable memory {mem!r} for job {row['jobid']}, counting 0")
-            mem_mb = 0
         alloc = {
             "id": row["jobid"],
-            "gpus": int(gpus) // n_nodes if gpus and gpus.isdigit() else 0,
-            "cpus": int(cpus) // n_nodes if cpus and cpus.isdigit() else 0,
-            "mem_mb": mem_mb // n_nodes,
+            "gpus": held["gpus"] // n_nodes,
+            "cpus": held["cpus"] // n_nodes,
+            "mem_mb": held["mem_mb"] // n_nodes,
             "gpu_type": _gres_gpu_type(row["tres-per-node"], row["tres-per-job"], row["tres-per-task"]),
             "end": end,
             "limit": limit,
-            "array": row["arrayjobid"] if row["arrayjobid"] not in ("", "N/A") else None,
+            "array": held["array"],
         }
         for node in nodes:
             by_node[node].append(alloc)
@@ -1532,22 +1175,13 @@ def _competing_jobs(rows, priorities, partitions, score, gpu_type, node_gpus, ma
         if wanted_type and wanted_type != gpu_type:
             continue
         n_nodes = _first_int(row["numnodes"]) or 1
-        gpus = _tres_field(row["tres-alloc"], "gres/gpu")
-        cpus = _tres_field(row["tres-alloc"], "cpu")
-        mem = _tres_field(row["tres-alloc"], "mem")
-        gpn = -(-int(gpus) // n_nodes) if gpus and gpus.isdigit() else 0
+        asked = _row_alloc(row, max_minutes, "pending job")
+        gpn = -(-asked["gpus"] // n_nodes)
         if gpn > node_gpus:
             # Asks for more GPUs per node than this pool has: it will land elsewhere.
             continue
-        mem_mb = _mem_to_mb(mem) if mem else 0
-        if mem and mem_mb is None:
-            print(f"Warning: unparsable memory {mem!r} for pending job {row['jobid']}, counting 0")
-            mem_mb = 0
-        limit = _slurm_time_to_minutes(row["timelimit"])
-        if limit is None:
-            limit = max_minutes
         count, throttle = 1, None
-        array = row["arrayjobid"] if row["arrayjobid"] not in ("", "N/A") else None
+        array = asked["array"]
         if array and row["jobid"] == array and row["arraytaskid"] not in ("", "N/A"):
             count, throttle = _expand_array_tasks(row["arraytaskid"])
             if count > ARRAY_TASK_CAP:
@@ -1561,9 +1195,9 @@ def _competing_jobs(rows, priorities, partitions, score, gpu_type, node_gpus, ma
             "prio": prio,
             "nodes": n_nodes,
             "gpn": gpn,
-            "cpn": -(-int(cpus) // n_nodes) if cpus and cpus.isdigit() else 0,
-            "mpn": -(-mem_mb // n_nodes),
-            "minutes": limit,
+            "cpn": -(-asked["cpus"] // n_nodes),
+            "mpn": -(-asked["mem_mb"] // n_nodes),
+            "minutes": asked["minutes"],
             "array": array,
             "throttle": throttle,
         }
@@ -1722,10 +1356,7 @@ FINISHED_STATES = (
     "OUT_OF_MEMORY",
     "PREEMPTED",
 )
-# {"fetched_at": monotonic seconds, "data": {partition: {"ratio", "jobs"}}}
-_walltime_cache = {"fetched_at": None, "data": {}}
-
-
+@ttl_cache(WALLTIME_CACHE_SECONDS)
 def _walltime_efficiency():
     """Measure what fraction of its requested walltime a finished GPU job really uses.
 
@@ -1735,13 +1366,6 @@ def _walltime_efficiency():
     into a realistic figure. One sacct call covers every monitored partition, and
     the result is cached because it barely moves between page refreshes.
     """
-    now = time.monotonic()
-    if (
-        _walltime_cache["fetched_at"] is not None
-        and now - _walltime_cache["fetched_at"] < WALLTIME_CACHE_SECONDS
-    ):
-        return _walltime_cache["data"]
-
     cmd = (
         f"sacct -a -X -S now-{WALLTIME_SAMPLE_DAYS}days -r {MONITORED_PARTITIONS} "
         "-n -P -o Partition,Elapsed,Timelimit,State,AllocTRES"
@@ -1750,10 +1374,11 @@ def _walltime_efficiency():
         rows = parse_cmd(cmd)
     except CalledProcessError as exc:
         print(f"Warning: sacct failed ({exc}); the Typical column will be blank")
-        _walltime_cache.update({"fetched_at": now, "data": {}})
         return {}
 
     totals = defaultdict(lambda: {"elapsed": 0, "limit": 0, "jobs": 0})
+    # Routine skips, tallied and reported once below.
+    unfinished = cpu_only = unlimited = 0
     for row in rows:
         fields = row.split("|")
         if len(fields) < 5:
@@ -1761,13 +1386,16 @@ def _walltime_efficiency():
             continue
         partition, elapsed_str, limit_str, state, tres = fields[:5]
         if not state.startswith(FINISHED_STATES):
+            unfinished += 1
             continue
         if "gres/gpu" not in tres:
+            cpu_only += 1
             continue
         elapsed = _slurm_time_to_minutes(elapsed_str)
         limit = _slurm_time_to_minutes(limit_str)
         if not limit:
             # UNLIMITED or unparsable: there is no ratio to compute against.
+            unlimited += 1
             continue
         if elapsed is None:
             print(f"Warning: sacct row {row!r} has no elapsed time, skipping")
@@ -1776,6 +1404,8 @@ def _walltime_efficiency():
         entry["elapsed"] += elapsed
         entry["limit"] += limit
         entry["jobs"] += 1
+    print(f"Note: walltime sample left out {unfinished} unfinished, {cpu_only} CPU-only and "
+          f"{unlimited} unlimited jobs")
 
     data = {}
     for partition, entry in totals.items():
@@ -1791,7 +1421,6 @@ def _walltime_efficiency():
             "ratio": min(entry["elapsed"] / entry["limit"], 1.0),
             "jobs": entry["jobs"],
         }
-    _walltime_cache.update({"fetched_at": now, "data": data})
     return data
 
 
@@ -1829,28 +1458,49 @@ def parse_wait_estimate_to_table(job=None):
     if not specs:
         return "<p>No GPU partitions found.</p>"
 
-    pools = _gpu_pools()
-    states = pools["states"]
-    total_by_node = pools["total_by_node"]
-    free_by_node = pools["free_by_node"]
-    partition_nodes = _partition_nodes()
-    shapes = _node_shapes()
-    limits = _partition_limits()
-    efficiency = _walltime_efficiency()
-    factors = _partition_factors()
-    scores = _account_score(job["account"], factors)
+    # The SLURM reads below and the per-pool sbatch --test-only checks do not
+    # depend on one another, and this panel sets how long a page load takes, so
+    # overlap them. The pool is kept small: the login node is short of memory
+    # to fork with, and parse_cmd already shares one run of a repeated command.
+    with ThreadPoolExecutor(max_workers=WAIT_ESTIMATE_WORKERS) as pool:
+        verdicts = [pool.submit(_test_only_check, spec, job["account"]) for spec in specs]
+        reads = {
+            name: pool.submit(fetch)
+            for name, fetch in (
+                ("pools", _gpu_pools),
+                ("partition_nodes", _partition_nodes),
+                ("shapes", _node_shapes),
+                ("limits", _partition_limits),
+                ("efficiency", _walltime_efficiency),
+                ("factors", _partition_factors),
+                ("priorities", _sprio_by_job),
+                ("running", lambda: squeue_jobs("RUNNING")),
+                ("pending", lambda: squeue_jobs("PENDING", MONITORED_PARTITIONS)),
+            )
+        }
+        scores = _account_score(job["account"], reads["factors"].result())
+        read = {name: future.result() for name, future in reads.items()}
+        verdicts = [future.result() for future in verdicts]
     if scores is None:
         return (
             f"<p>Could not work out the priority a job from <b>{job['account']}</b> "
             "would get, so there is nothing to estimate against.</p>"
         )
-    priorities = _sprio_by_job()
+    pools = read["pools"]
+    states = pools["states"]
+    total_by_node = pools["total_by_node"]
+    free_by_node = pools["free_by_node"]
+    partition_nodes = read["partition_nodes"]
+    shapes = read["shapes"]
+    limits = read["limits"]
+    efficiency = read["efficiency"]
+    priorities = read["priorities"]
     now = datetime.now()
     default_limit = max(
         (l["max_minutes"] for l in limits.values() if l["max_minutes"]), default=3 * 24 * 60
     )
-    running_by_node = _running_jobs_by_node(_squeue_rows("-t RUNNING"), now, default_limit)
-    pending_rows = _squeue_rows(f"-t PENDING -p {MONITORED_PARTITIONS}")
+    running_by_node = _running_jobs_by_node(read["running"], now, default_limit)
+    pending_rows = read["pending"]
 
     def _count(by_node, partition, gpu_type):
         return sum(
@@ -1863,9 +1513,8 @@ def parse_wait_estimate_to_table(job=None):
     rows = []
     unavailable = []
     no_access = []
-    for spec in specs:
+    for spec, failure in zip(specs, verdicts):
         partition, gpu_type = spec["partition"], spec["gpu_type"]
-        failure = _test_only_check(spec, job["account"])
         if failure is not None:
             if failure[0] == "no_access":
                 no_access.append((spec, failure[1]))
@@ -2118,7 +1767,7 @@ def _qos_priorities():
     return priorities
 
 
-def _account_priority_profile(accounts=LAB_ACCOUNTS):
+def _account_priority_profile(accounts):
     """Fairshare factor and highest-priority QOS available to each of ``accounts``."""
     account_list = ",".join(accounts)
     shares = defaultdict(list)
@@ -2129,7 +1778,10 @@ def _account_priority_profile(accounts=LAB_ACCOUNTS):
             continue
         account, user, share = (f.strip() for f in fields[:3])
         # The account-level row carries no FairShare of its own; only users do.
-        if not user or not share:
+        if not user:
+            continue
+        if not share:
+            print(f"Warning: no FairShare for {account}/{user}, skipping")
             continue
         try:
             shares[account].append(float(share))
@@ -2181,17 +1833,11 @@ def _partition_priority_data():
     here, which is what we want: the ranking is against the jobs actually racing
     us for a node right now.
     """
-    rows = parse_cmd("sprio -h -o '%r|%Y|%P'")
     totals = defaultdict(list)
     factors = {}
-    for row in rows:
-        fields = row.split("|")
-        if len(fields) < 3:
-            print(f"Warning: unexpected sprio row {row!r}, skipping")
-            continue
-        partition, total, factor = (f.strip() for f in fields[:3])
+    for jobid, partition, total, factor in _sprio_rows():
         if not total.isdigit() or not factor.isdigit():
-            print(f"Warning: unparsable sprio numbers in {row!r}, skipping")
+            print(f"Warning: unparsable sprio numbers {total!r}/{factor!r} for job {jobid}, skipping")
             continue
         totals[partition].append(int(total))
         if partition in factors and factors[partition] != int(factor):
@@ -2212,51 +1858,37 @@ def parse_priority_to_table(account=None):
     profile, max_qos = _account_priority_profile((account,))
     if account not in profile or not max_qos:
         return f"<p>Could not read the priority settings of <b>{account}</b> from SLURM.</p>"
-    weights = _priority_weights()
     totals, factors = _partition_priority_data()
 
-    accounts = [account]
     partitions = [p for p in _partition_nodes() if p in totals]
     partitions.sort(key=lambda p: factors.get(p, 0), reverse=True)
     if not partitions:
         return "<p>No GPU partition currently has jobs competing for priority.</p>"
-
-    def _score(account, partition):
-        entry = profile[account]
-        qos_part = entry["qos_priority"] / max_qos * weights["PriorityWeightQOS"]
-        fair_part = entry["fairshare"] * weights["PriorityWeightFairShare"]
-        # A job submitted right now has no age factor yet.
-        return int(qos_part + fair_part + factors.get(partition, 0))
+    # A job submitted right now has no age factor yet.
+    scores = _account_score(account, {p: factors.get(p, 0) for p in partitions})
 
     header = (
         '<tr><th>Partition</th><th title="Pending jobs SLURM is currently ranking in '
         'this partition; jobs blocked by a dependency get no priority and are not '
-        'counted">Competing</th>'
-        + "".join(
-            f'<th>{a}<br><span class="queue-muted">{profile[a]["qos"]} '
-            f'/ fs {profile[a]["fairshare"]:.3f}</span></th>'
-            for a in accounts
-        )
-        + "</tr>"
+        f'counted">Competing</th><th>{account}<br><span class="queue-muted">'
+        f'{profile[account]["qos"]} / fs {profile[account]["fairshare"]:.3f}</span></th></tr>'
     )
 
     body = ""
     for partition in partitions:
         values = totals[partition]
-        cells = ""
-        for account in accounts:
-            score = _score(account, partition)
-            rank = bisect.bisect_left(values, score) / len(values) * 100
-            if rank >= 75:
-                css = "queue-pressure-low"
-            elif rank >= 40:
-                css = "queue-pressure-mid"
-            else:
-                css = "queue-pressure-high"
-            cells += (
-                f'<td><span class="{css}" title="priority {score:,} vs a median of '
-                f'{values[len(values) // 2]:,} in {partition}">{rank:.0f}%</span></td>'
-            )
+        score = scores[partition]
+        rank = bisect.bisect_left(values, score) / len(values) * 100
+        if rank >= 75:
+            css = "queue-pressure-low"
+        elif rank >= 40:
+            css = "queue-pressure-mid"
+        else:
+            css = "queue-pressure-high"
+        cells = (
+            f'<td><span class="{css}" title="priority {score:,} vs a median of '
+            f'{values[len(values) // 2]:,} in {partition}">{rank:.0f}%</span></td>'
+        )
         body += (
             f"<tr><td><b>{partition}</b> "
             f'<span class="queue-muted">(factor {factors.get(partition, 0):,})</span></td>'
@@ -2269,7 +1901,7 @@ def parse_priority_to_table(account=None):
         "against the whole cluster would be misleading, because the partition factor "
         "shown next to each pool is added to every job there alike and cancels out. "
         "Priority = QOS + fairshare + partition factor; age is worth at most "
-        f"{weights['PriorityWeightAge']:,} even after weeks, so a new job is not "
+        f"{_priority_weights()['PriorityWeightAge']:,} even after weeks, so a new job is not "
         "meaningfully behind an old one. Fairshare is the median across each account's "
         "users and moves as the lab uses the cluster.</p>"
     )
@@ -2308,39 +1940,25 @@ def parse_queue_to_table(account=None):
     carries their range the way squeue prints it, e.g. ``20478034_[155-742%4]``.
     The last line totals the account's pending jobs and the GPUs they ask for,
     counting each task of such a row.
-
-    The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
-    carries no shell syntax.
     """
     account = account or LAB_ACCOUNTS[0]
-    columns = (
-        ("JobId", 32), ("ArrayTaskID", 64), ("Partition", 80), ("UserName", 16),
-        ("TimeLimit", 14), ("tres-alloc", 160), ("SubmitTime", 22), ("StartTime", 22),
-        ("Reason", 120),
-    )
-    fmt = ",".join(f"{name}:{width}" for name, width in columns)
-    rows = parse_cmd(f"squeue -a -h -t PENDING -A {account} -O '{fmt}'")
-    if not rows:
+    columns = ("jobid", "arraytaskid", "partition", "username", "timelimit",
+               "tres-alloc", "submittime", "starttime", "reason")
+    jobs = [job for job in squeue_jobs("PENDING") if job["account"] == account]
+    if not jobs:
         return f"no pending job in {account}"
-
-    jobs = []
-    for row in rows:
-        fields = []
-        pos = 0
-        for _, width in columns:
-            fields.append(row[pos : pos + width].strip())
-            pos += width
-        jobs.append(fields)
 
     shown = []
     total_jobs = total_gpus = 0
-    for jobid, tasks, partition, user, limit, tres, submit, start, reason in jobs:
+    for jobid, tasks, partition, user, limit, tres, submit, start, reason in (
+        [job[c] for c in columns] for job in jobs
+    ):
         count = 1
         if tasks not in ("", "N/A"):
             count, _ = _expand_array_tasks(tasks)
             if count > 1:
                 jobid = f"{jobid}_[{tasks}]"
-        gpus = _alloc_gpu_count(tres)
+        gpus = alloc_gpu_count(tres)
         total_jobs += count
         total_gpus += count * gpus
         shown.append((jobid, partition, user, limit, gpus, submit, start, reason))
@@ -2364,18 +1982,11 @@ def _gpu_type_on_nodes(jobid, node_str, inventory):
     A job sent to a mixed partition such as ``gpu`` without naming a type has no
     type anywhere in squeue; only the node it landed on tells. ``inventory`` is
     :func:`parse_all_gpus` output. Returns ``?`` when the node list is missing or
-    cut off, or a node is missing from the inventory, and every type joined with
-    ``/`` when the nodes offer more than one, since the job's own share cannot be
-    told apart then.
+    a node is missing from the inventory, and every type joined with ``/`` when
+    the nodes offer more than one, since the job's own share cannot be told
+    apart then.
     """
-    try:
-        nodes = parse_node_names(node_str) if node_str else []
-    except ValueError as err:
-        # squeue -O cuts a field at its width without a word, so a long node list
-        # can end inside its brackets.
-        print(f"Warning: cannot parse node list {node_str!r} of job {jobid} ({err}); "
-              "type shown as ?")
-        return "?"
+    nodes = parse_node_names(node_str) if node_str else []
     if not nodes:
         print(f"Warning: GPU job {jobid} has no node list; type shown as ?")
         return "?"
@@ -2398,33 +2009,20 @@ def parse_running_to_table(account=None):
     squeue reports them. GPUS is what the job holds, read from its allocated
     TRES, and GPU_TYPE the type of the nodes it runs on (see
     :func:`_gpu_type_on_nodes`). The last line totals the account's jobs and GPUs.
-
-    The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
-    carries no shell syntax.
     """
     account = account or LAB_ACCOUNTS[0]
-    columns = (
-        ("JobId", 32), ("Partition", 80), ("UserName", 16), ("TimeUsed", 14),
-        ("TimeLimit", 14), ("tres-alloc", 160), ("StartTime", 22), ("NodeList", 200),
-    )
-    fmt = ",".join(f"{name}:{width}" for name, width in columns)
-    rows = parse_cmd(f"squeue -a -h -t RUNNING -A {account} -O '{fmt}'")
-    if not rows:
+    columns = ("jobid", "partition", "username", "timeused", "timelimit",
+               "tres-alloc", "starttime", "nodelist")
+    jobs = [job for job in squeue_jobs("RUNNING") if job["account"] == account]
+    if not jobs:
         return f"no running job in {account}"
-
-    jobs = []
-    for row in rows:
-        fields = []
-        pos = 0
-        for _, width in columns:
-            fields.append(row[pos : pos + width].strip())
-            pos += width
-        jobs.append(fields)
 
     inventory = parse_all_gpus()
     shown = []
-    for jobid, partition, user, used, limit, tres, start, nodes in jobs:
-        gpus = _alloc_gpu_count(tres)
+    for jobid, partition, user, used, limit, tres, start, nodes in (
+        [job[c] for c in columns] for job in jobs
+    ):
+        gpus = alloc_gpu_count(tres)
         gpu_type = _gpu_type_on_nodes(jobid, nodes, inventory) if gpus else "-"
         shown.append((jobid, partition, user, used, limit, gpus, gpu_type, start, nodes))
 
@@ -2445,133 +2043,30 @@ def parse_running_to_table(account=None):
     return "\n".join(out)
 
 
-def parse_disk_io():
-    """Measure disk reading speed, parse the output to a html table.
-
-    Pre-requisite: create a byte file by running
-    `dd if=/dev/zero of=/your/path/test.img bs=512MB count=1 oflag=dsync`."""
-
-    # return '<p>Under maintenance. </p>'
-
-    try:
-        beegfs_ultra_read = check_output(
-            "dd if=/scratch/shared/beegfs/shared-datasets/test/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        beegfs_ultra_read = beegfs_ultra_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        beegfs_ultra_read = "N/A"
-
-    try:
-        beegfs_fast_read = check_output(
-            "dd if=/scratch/shared/beegfs/htd/DATA/tmp/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        beegfs_fast_read = beegfs_fast_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        beegfs_fast_read = "N/A"
-
-    try:
-        beegfs_normal_read = check_output(
-            "dd if=/scratch/shared/beegfs/htd/tmp/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        beegfs_normal_read = beegfs_normal_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        beegfs_normal_read = "N/A"
-
-    try:
-        work_normal_read = check_output(
-            "dd if=/work/htd/Desktop_tmp/tmp/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        work_normal_read = work_normal_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        work_normal_read = "N/A"
-
-    summary = (
-        "<tr> <td><b>{}</b></td> <td><b>{}</b></td> <td><b>{}</b></td> </tr>".format(
-            "Disk", "Type", "Read Speed"
-        )
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td> </tr>".format(
-        "/beegfs/shared-datasets <i>[ultra-fast-layer]</i>",
-        "NVMe flash",
-        beegfs_ultra_read,
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td> </tr>".format(
-        "/beegfs <i>[fast-layer]</i>", "SSD flash", beegfs_fast_read
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td> </tr>".format(
-        "/beegfs <i>[normal-layer]</i>", "HDD", beegfs_normal_read
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td></tr>".format(
-        "/work", "HDD", work_normal_read
-    )
-    table_html = f"<table>{summary}</table>"
-
-    return table_html
-
-
 def parse_disk_quota():
     """Run 'hdquota' command and parse the output to an HTML table."""
     try:
         output = check_output("hdquota", shell=True).decode("utf-8")
-        lines = output.split('\n')
-        
-        # Create HTML table with headers
-        headers = ["Storage Type", "Location", "Size", "Used", "Avail", "Use%"]
-        table_html = "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
-        
-        # Add data rows
-        for line in lines[2:]:  # Skip header and separator lines
-            if not line.strip():
-                continue
-            
-            # Split the line into parts, handling spaces correctly
-            parts = line.split()
-            
-            # Skip lines that don't have enough parts
-            if len(parts) < 9:  # Changed from 10 to 9 to handle single-word storage types
-                continue
-                
-            try:
-                # Handle storage type (could be one or two words)
-                if parts[1] in ["Directory", "Project", "Standard"]:
-                    storage_type = f"{parts[0]} {parts[1]}"
-                    location = parts[2]
-                    size = f"{parts[3]} {parts[4]}"
-                    used = f"{parts[5]} {parts[6]}"
-                    avail = f"{parts[7]} {parts[8]}"
-                    use_percent = parts[9]
-                else:
-                    storage_type = parts[0]
-                    location = parts[1]
-                    size = f"{parts[2]} {parts[3]}"
-                    used = f"{parts[4]} {parts[5]}"
-                    avail = f"{parts[6]} {parts[7]}"
-                    use_percent = parts[8]
-                
-                table_html += "<tr>"
-                table_html += f"<td>{storage_type}</td>"
-                table_html += f"<td>{location}</td>"
-                table_html += f"<td>{size}</td>"
-                table_html += f"<td>{used}</td>"
-                table_html += f"<td>{avail}</td>"
-                table_html += f"<td>{use_percent}</td>"
-                table_html += "</tr>"
-            except IndexError:
-                continue
-        
-        table_html += "</table>"
-        return table_html
-    except Exception as e:
-        error_msg = f"Error getting disk quota information: {str(e)}"
-        return f"<p>{error_msg}</p>"
+    except (CalledProcessError, OSError) as exc:
+        print(f"Warning: hdquota failed: {exc}")
+        return f"<p>Error getting disk quota information: {exc}</p>"
+
+    headers = ["Storage Type", "Location", "Size", "Used", "Avail", "Use%"]
+    table_html = "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
+    for line in output.split("\n")[2:]:  # Skip header and separator lines
+        parts = line.split()
+        if not parts:
+            continue
+        # The storage type is one word ("Scratch") or two ("Home Directory").
+        if len(parts) > 1 and parts[1] in ("Directory", "Project", "Standard"):
+            parts = [f"{parts[0]} {parts[1]}"] + parts[2:]
+        if len(parts) < 9:
+            print(f"Warning: unexpected hdquota line {line!r}, skipping")
+            continue
+        size, used, avail = (f"{parts[i]} {parts[i + 1]}" for i in (2, 4, 6))
+        cells = (parts[0], parts[1], size, used, avail, parts[8])
+        table_html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
+    return table_html + "</table>"
 
 
 def parse_allocations_to_table(account=None):
@@ -2666,14 +2161,10 @@ def parse_allocations_to_table(account=None):
 # both sstat and a --jobid step are refused for someone else's allocation.
 # ---------------------------------------------------------------------------
 
-MY_JOBS_FORMAT = (
-    ("jobid", 16),
-    ("name", 48),
-    ("partition", 32),
-    ("timeused", 16),
-    ("timelimit", 16),
-    ("tres-alloc", 300),
-)
+# The job name is free text and so goes last, see squeue_fields.
+MY_JOBS_FORMAT = ("jobid", "partition", "timeused", "timelimit", "tres-alloc", "name")
+# Longest job name shown under its id; longer ones are cut to keep the column narrow.
+JOB_NAME_WIDTH = 48
 # srun resolves the command against the submitting shell's PATH, which does not
 # reach the compute node's own binaries, so both of these are absolute paths.
 # The probe script sits next to this file, on the shared storage the compute
@@ -2740,32 +2231,9 @@ def _slurm_time_to_seconds(text):
     return days * 86400 + seconds
 
 
-def _alloc_gpu_count(tres):
-    """GPUs in a TRES string, counting the typed form (``gres/gpu:a40=1``) too."""
-    total = _tres_field(tres, "gres/gpu")
-    if total is not None and total.isdigit():
-        return int(total)
-    typed = re.findall(r"(?:^|,)gres/gpu:[^=,]+=(\d+)", tres)
-    return sum(int(n) for n in typed)
-
-
 def _my_running_jobs():
     """One dict per running job of this account, in squeue's own order."""
-    owner = _app_owner()
-    fmt = ",".join(f"{name}:{width}" for name, width in MY_JOBS_FORMAT)
-    rows = parse_cmd(f"squeue -a -h -u {owner} -t RUNNING -O '{fmt}'")
-    jobs = []
-    for row in rows:
-        entry = {}
-        pos = 0
-        for name, width in MY_JOBS_FORMAT:
-            entry[name] = row[pos : pos + width].strip()
-            pos += width
-        if not entry["jobid"]:
-            print(f"Warning: squeue row without a job id {row[:80]!r}, skipping")
-            continue
-        jobs.append(entry)
-    return jobs
+    return squeue_fields(f"-a -h -u {_app_owner()} -t RUNNING", MY_JOBS_FORMAT)
 
 
 def _sstat_usage(jobids):
@@ -2798,28 +2266,28 @@ def _sstat_usage(jobids):
              "gpu_util": None, "gpu_mem_mb": None},
         )
 
-        cpu = _slurm_time_to_seconds(_tres_field(ave, "cpu") or "")
+        cpu = _slurm_time_to_seconds(tres_field(ave, "cpu") or "")
         if cpu is not None:
             entry["cpu_seconds"] += cpu
         for key, tres in (("mem_mb", ave), ("peak_mem_mb", peak)):
-            mem = _tres_field(tres, "mem")
+            mem = tres_field(tres, "mem")
             if mem is None:
                 continue
-            mem_mb = _mem_to_mb(mem)
+            mem_mb = mem_to_mb(mem)
             if mem_mb is None:
                 print(f"Warning: unparsable memory {mem!r} for step {step}, ignoring it")
                 continue
             entry[key] += mem_mb
 
-        util = _tres_field(ave, "gres/gpuutil")
+        util = tres_field(ave, "gres/gpuutil")
         if util is not None:
             if util.isdigit():
                 entry["gpu_util"] = max(entry["gpu_util"] or 0, int(util))
             else:
                 print(f"Warning: unparsable gres/gpuutil {util!r} for step {step}, ignoring it")
-        gpu_mem = _tres_field(ave, "gres/gpumem")
+        gpu_mem = tres_field(ave, "gres/gpumem")
         if gpu_mem is not None:
-            gpu_mem_mb = _mem_to_mb(gpu_mem)
+            gpu_mem_mb = mem_to_mb(gpu_mem)
             if gpu_mem_mb is None:
                 print(f"Warning: unparsable gres/gpumem {gpu_mem!r} for step {step}, ignoring it")
             else:
@@ -3206,7 +2674,7 @@ def parse_my_jobs_to_table():
         )
 
     jobids = [job["jobid"] for job in jobs]
-    gpu_jobs = [job["jobid"] for job in jobs if _alloc_gpu_count(job["tres-alloc"])]
+    gpu_jobs = [job["jobid"] for job in jobs if alloc_gpu_count(job["tres-alloc"])]
     # The two wait on different things -- sstat on the accounting plugin, the
     # probes on the nodes running the jobs -- and neither needs the other, so
     # overlap them instead of paying for both in turn.  One extra thread next to
@@ -3236,8 +2704,8 @@ def parse_my_jobs_to_table():
         jobid = job["jobid"]
         tres = job["tres-alloc"]
         counters = usage.get(jobid)
-        alloc_cpus = _tres_count(_tres_field(tres, "cpu"))
-        alloc_mem_mb = _mem_to_mb(_tres_field(tres, "mem") or "")
+        alloc_cpus = _tres_count(tres_field(tres, "cpu"))
+        alloc_mem_mb = mem_to_mb(tres_field(tres, "mem") or "")
         elapsed = _slurm_time_to_seconds(job["timeused"])
         limit = _slurm_time_to_seconds(job["timelimit"])
 
@@ -3256,7 +2724,7 @@ def parse_my_jobs_to_table():
             if position == 0:
                 html.append(
                     f'<td{span}>{jobid}<br><span class="job-name">'
-                    f'{escape(job["name"])}</span></td>'
+                    f'{escape(job["name"][:JOB_NAME_WIDTH].rstrip())}</span></td>'
                 )
                 html.append(f'<td{span}>{escape(job["partition"])}</td>')
                 html.append(
@@ -3415,10 +2883,6 @@ def main():
     def leaderboard():
         return slurm_response(parse_leaderboard)
 
-    @app.route("/leaderboard_partition")
-    def leaderboard_partition():
-        return slurm_response(parse_leaderboard_by_partition)
-
     @app.route("/disk_quota")
     def disk_quota():
         return slurm_response(parse_disk_quota)
@@ -3430,13 +2894,6 @@ def main():
     @app.route("/my_jobs")
     def my_jobs():
         return slurm_response(parse_my_jobs_to_table)
-
-    # @app.route('/cpu_resource')
-    # def cpu_resource():
-    #     def generate():
-    #         out = parse_cpu_usage_to_table()
-    #         yield out
-    #     return Response(generate(), mimetype='text')
 
     app.run(host=args.host, port=args.port)
 

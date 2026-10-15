@@ -1,32 +1,22 @@
 """Credit to https://github.com/albanie/slurm_gpustat with minor modifications for web app.
 
-A simple tool for summarising GPU statistics on a slurm cluster.
-
-The tool can be used in two ways:
-1. To simply query the current usage of GPUs on the cluster.
-2. To launch a daemon which will log usage over time.  This can then later be queried
-   to provide simple usage statistics.
+A simple tool for summarising the current GPU usage on a slurm cluster.
 """
 
 import os
 import re
-import ast
-import sys
 import time
 import threading
-import atexit
-import signal
 import argparse
 import functools
 import subprocess
 from typing import Optional
-from pathlib import Path
-from datetime import datetime
 from collections import defaultdict
 
 # Same reason as in app.py: the login node is close to its strict-overcommit
 # limit, and a 40-thread OpenBLAS pool is both useless here and large enough to
-# push allocations over it.  Must run before numpy is imported.
+# push allocations over it.  Nothing here uses numpy, but available_resources.py
+# imports this module before pandas so that this runs before numpy is loaded.
 for _blas_var in (
     "OPENBLAS_NUM_THREADS",
     "OMP_NUM_THREADS",
@@ -36,12 +26,9 @@ for _blas_var in (
 ):
     os.environ.setdefault(_blas_var, "1")
 
-import numpy as np
 import colored
-import humanize
 import humanfriendly as hf
 from beartype import beartype
-from django.utils.functional import lazy
 
 
 # SLURM states which indicate that the node is not available for submitting jobs
@@ -57,246 +44,23 @@ SLURM_RETRY_DELAY = 1.0
 # to one of the typed partitions as well.
 MONITORED_PARTITIONS = "gpu,gpu-a100-40,gpu-a100-80,gpu-a40,gpu-a6000,gpu-v100,gpu-b200,gpu-rtxpro6000,gpu-mig,gpu-mig-rtxpro6000,interactive,interactive-rtx2080,interactive-rtx3090,dedicated"
 
+# The accounts offered in the page's account picker; the first one is what the
+# page starts on. Everything account-scoped -- the allocation, priority, queue
+# and wait-estimate panels -- follows whichever one is picked, so only accounts
+# we would really submit under belong here.  uva_cv_lab2 is the paid account and
+# is off limits, and dac_cheng has had no allocation since early 2026.
+LAB_ACCOUNTS = tuple(
+    a.strip()
+    for a in os.environ.get("RIVANNA_ACCOUNTS", "uva_cv_lab,cang-lab-in-silico").split(",")
+    if a.strip()
+)
+
 
 def is_inaccessible(state: str) -> bool:
     state_lower = state.lower().rstrip("*~$#%")
     if state_lower in INACCESSIBLE:
         return True
     return any(kw in state_lower for kw in INACCESSIBLE_KEYWORDS)
-
-
-class Daemon:
-    """A Generic linux daemon base class for python 3.x.
-
-    This code is a Python3 port of Sander Marechal's Daemon module:
-    http://web.archive.org/web/20131017130434/http://www.jejik.com/articles/
-    2007/02/a_simple_unix_linux_daemon_in_python/
-
-    It's a little difficult to credit the author of the Python3 port, since the code was
-    published anonymously. The original can be found here:
-    http://web.archive.org/web/20131101191715/http://www.jejik.com/files/examples/
-    daemon3x.py
-    """
-
-    def __init__(self, pidfile):
-        self.pidfile = pidfile
-
-    def daemonize(self):
-        """Deamonize class. UNIX double fork mechanism."""
-        try:
-            pid = os.fork()
-            if pid > 0:
-                # exit first parent
-                sys.exit(0)
-        except OSError as err:
-            sys.stderr.write('fork #1 failed: {0}\n'.format(err))
-            sys.exit(1)
-
-        # decouple from parent environment
-        os.chdir('/')
-        os.setsid()
-        os.umask(0)
-
-        # do second fork
-        try:
-            pid = os.fork()
-            if pid > 0:
-                # exit from second parent
-                sys.exit(0)
-        except OSError as err:
-            sys.stderr.write('fork #2 failed: {0}\n'.format(err))
-            sys.exit(1)
-        
-        # redirect standard file descriptors
-        sys.stdout.flush()
-        sys.stderr.flush()
-        si = open(os.devnull, 'r')
-        so = open(os.devnull, 'a+')
-        se = open(os.devnull, 'a+')
-
-        os.dup2(si.fileno(), sys.stdin.fileno())
-        os.dup2(so.fileno(), sys.stdout.fileno())
-        os.dup2(se.fileno(), sys.stderr.fileno())
-
-        # write pidfile
-        atexit.register(self.delpid)
-        signal.signal(signal.SIGTERM, lambda signum, stack_frame: exit())
-
-        pid = str(os.getpid())
-        with open(self.pidfile, 'w+') as f:
-            f.write(pid + '\n')
-
-    def delpid(self):
-        os.remove(self.pidfile)
-
-    def start(self):
-        """Start the daemon."""
-
-        # Check for a pidfile to see if the daemon already runs
-        try:
-            with open(self.pidfile, 'r') as pf:
-                pid = int(pf.read().strip())
-        except IOError:
-            pid = None
-
-        if pid:
-            message = "pidfile {0} already exists. Is the daemon already running?\n"
-            sys.stderr.write(message.format(self.pidfile))
-            sys.exit(1)
-
-        # Start the daemon
-        self.daemonize()
-        self.run()
-
-    def stop(self):
-        """Stop the daemon."""
-
-        # Get the pid from the pidfile
-        try:
-            with open(self.pidfile, 'r') as pf:
-                pid = int(pf.read().strip())
-        except IOError:
-            pid = None
-
-        if not pid:
-            message = "pidfile {0} does not exist. Daemon not running?\n"
-            sys.stderr.write(message.format(self.pidfile))
-            return  # not an error in a restart
-
-        # Try killing the daemon process
-        try:
-            while 1:
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.1)
-        except OSError as err:
-            e = str(err.args)
-            if e.find("No such process") > 0:
-                if os.path.exists(self.pidfile):
-                    os.remove(self.pidfile)
-            else:
-                print(str(err.args))
-                sys.exit(1)
-
-    def restart(self):
-        """Restart the daemon."""
-        self.stop()
-        self.start()
-
-    def run(self):
-        """You should override this method when you subclass Daemon.
-        It will be called after the process has been daemonized by
-        start() or restart()."""
-        raise NotImplementedError("Must override this class")
-
-
-class GPUStatDaemon(Daemon):
-    """A lightweight daemon which intermittently logs gpu usage to a text file.
-    """
-    timestamp_format = "%Y-%m-%d_%H:%M:%S"
-
-    def __init__(self, pidfile, log_path, log_interval):
-        """Create the daemon.
-
-        Args:
-            pidfile (str): the location of the daemon pid file.
-            log_path (str): the location where the historical log will be stored.
-            log_interval (int): the time interval (in seconds) at which gpu usage will
-                be stored to the log.
-        """
-        Path(pidfile).parent.mkdir(exist_ok=True, parents=True)
-        super().__init__(pidfile=pidfile)
-        Path(log_path).parent.mkdir(exist_ok=True, parents=True)
-        self.log_interval = log_interval
-        self.log_path = log_path
-
-    def serialize_usage(self, usage):
-        """Convert data structure into an appropriate string for serialization.
-
-        Args:
-            usage (a dict-like structure): a data-structure which has the form of a
-                dictionary, but may contain variants with length string representations
-                (e.g. defaultdict, OrderedDict etc.)
-
-        Returns:
-            (str): a string representation of the usage data strcture.
-        """
-        for user, gpu_dict in usage.items():
-            for key, subdict in gpu_dict.items():
-                usage[user][key] = dict(subdict)
-        usage = dict(usage)
-        return usage.__repr__()
-
-    @staticmethod
-    def deserialize_usage(log_path):
-        """Parse the `usage` data structure by reading in the contents of the text-based
-        log file and deserializing.
-
-        Args:
-            log_path (str): the location of the log file.
-
-        Returns:
-            (list[dict]): a list of dicts, where each dict contains the time stamp
-                associated with a set of usage statistics, together with the statistics
-                themselves.
-        """
-        if not Path(log_path).exists():
-            raise ValueError("No historical log found.  Did you start the daemon?")
-        with open(log_path, "r") as f:
-            rows = f.read().splitlines()
-        data = []
-        for row in rows:
-            ts, usage = row.split(maxsplit=1)
-            dt = datetime.strptime(ts, GPUStatDaemon.timestamp_format)
-            usage = ast.literal_eval(usage)
-            data.append({"timestamp": dt, "usage": usage})
-        return data
-
-    def run(self):
-        """Run the daemon - will intermittently log gpu usage to disk.
-        """
-        while True:
-            resources = parse_all_gpus()
-            usage = gpu_usage(resources)
-            log_row = self.serialize_usage(usage)
-            timestamp = datetime.now().strftime(GPUStatDaemon.timestamp_format)
-            with open(self.log_path, "a") as f:
-                f.write(f"{timestamp} {log_row}\n")
-            time.sleep(self.log_interval)
-
-
-def historical_summary(data):
-    """Print a short summary of the historical gpu usage logged by the daemon.
-
-    Args:
-        data (list): the data structure deserialized from the daemon log file (this is
-            the output of the GPUStatDaemon.deserialize_usage() function.)
-    """
-    first_ts, last_ts = data[0]["timestamp"], data[-1]["timestamp"]
-    print(f"Historical data contains {len(data)} samples ({first_ts} to {last_ts})")
-    latest_usage = data[-1]["usage"]
-    users, gpu_types = set(), set()
-    for user, resources in latest_usage.items():
-        users.add(user)
-        gpu_types.update(set(resources.keys()))
-    history = {}
-    for row in data:
-        for user, subdict in row["usage"].items():
-            if user not in history:
-                history[user] = {gpu_type: [] for gpu_type in gpu_types}
-            type_counts = {key: sum(val.values()) for key, val in subdict.items()}
-            for gpu_type in gpu_types:
-                history[user][gpu_type].append(type_counts.get(gpu_type, 0))
-
-    for user, subdict in history.items():
-        print(f"GPU usage for {user}:")
-        total = 0
-        for gpu_type, counts in subdict.items():
-            counts = np.array(counts)
-            if counts.sum() == 0:
-                continue
-            print(f"{gpu_type:5s} > avg: {int(counts.mean())}, max: {np.max(counts)}")
-            total += counts.mean()
-        print(f"total > avg: {int(total)}\n")
 
 
 def split_node_str(node_str):
@@ -475,24 +239,162 @@ def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
     return list(output) if isinstance(output, list) else output
 
 
+def ttl_cache(seconds):
+    """Cache a function's results per argument tuple for ``seconds``.
+
+    Expired entries are dropped whenever a new result is stored, so the cache only
+    ever holds what was asked for within the last ``seconds``.
+    """
+    def decorate(func):
+        cache = {}
+        guard = threading.Lock()
+
+        @functools.wraps(func)
+        def cached(*args):
+            now = time.monotonic()
+            with guard:
+                hit = cache.get(args)
+            if hit is not None and now - hit[0] < seconds:
+                return hit[1]
+            value = func(*args)
+            with guard:
+                for key in [k for k, (stamp, _) in cache.items() if now - stamp >= seconds]:
+                    del cache[key]
+                cache[args] = (now, value)
+            return value
+        return cached
+    return decorate
+
+
 def squeue_fields(args: str, fields) -> list:
     """Run ``squeue <args> -O`` over ``fields`` and return one dict per job.
 
     Given a width, squeue -O cuts a field to it without a word, and a node list cut
     inside its brackets cannot be parsed. So every field is asked for in full
-    (width 0) and closed with ``|``. A row whose field count is off -- a ``|``
-    inside some value -- is skipped with a warning.
+    (width 0) and closed with ``|``. Only the last field may itself contain a
+    ``|``, so free text such as a job name or pending reason goes last; a row
+    that still does not split into ``fields`` is skipped with a warning.
     """
     fmt = ",".join(f"{name}:0|" for name in fields)
     entries = []
     for row in parse_cmd(f"squeue {args} -O '{fmt}'"):
-        values = row.split("|")
-        if len(values) != len(fields) + 1 or values[-1].strip():
-            print(f"Warning: squeue row has {len(values) - 1} fields, expected "
-                  f"{len(fields)}: {row[:120]!r}, skipping")
+        values = row.rstrip().removesuffix("|").split("|", len(fields) - 1)
+        if len(values) != len(fields) or not row.rstrip().endswith("|"):
+            print(f"Warning: squeue row does not split into {len(fields)} fields: "
+                  f"{row[:120]!r}, skipping")
             continue
         entries.append({name: value.strip() for name, value in zip(fields, values)})
     return entries
+
+
+# Every field any panel or the CLI reads off a running or pending job. A filtered
+# squeue (-A, -p) takes about as long as a full one, so each state is read once in
+# full and shared, and callers filter the rows themselves. reason is free text and so
+# goes last, see squeue_fields.
+JOB_FIELDS = (
+    "jobid", "arrayjobid", "arraytaskid", "prioritylong", "partition", "account",
+    "username", "state", "batchflag", "submittime", "starttime", "endtime", "timeused",
+    "timelimit", "nodelist", "numnodes", "tres-per-node", "tres-per-job",
+    "tres-per-task", "tres-alloc", "reason",
+)
+
+
+def squeue_jobs(state: str, partitions: Optional[str] = None) -> list:
+    """Every job squeue -t ``state`` lists, as JOB_FIELDS dicts in squeue's order.
+
+    ``partitions`` (comma separated) keeps the jobs ``squeue --partition`` would:
+    those with any of them among the partitions they list.
+    """
+    jobs = squeue_fields(f"-a -h -t {state}", JOB_FIELDS)
+    if partitions:
+        wanted = set(partitions.split(","))
+        jobs = [job for job in jobs if wanted & set(job["partition"].split(","))]
+    return jobs
+
+
+_GRES_GPU = re.compile(r"gpu:(?:([^:]*):)?(\d*)(?:\(\S*\))?")
+
+
+def parse_gres_gpus(gres: str) -> list:
+    """``(type, count)`` for each GPU entry of a sinfo or scontrol gres string.
+
+    ``gpu:a100:8(S:0-1)`` gives ``[("a100", 8)]``. The type is None when the entry
+    names none and the count None when it gives none; what that means is up to
+    the caller. Entries that are not GPUs are ignored.
+    """
+    found = []
+    for entry in gres.strip().split(","):
+        if not entry.startswith("gpu"):
+            continue
+        match = _GRES_GPU.search(entry)
+        if not match:
+            print(f"Warning: could not parse gres entry {entry!r}, skipping it")
+            continue
+        found.append((match.group(1) or None, int(match.group(2)) if match.group(2) else None))
+    return found
+
+
+def tres_field(tres, name):
+    """Value of ``name`` in a TRES string like ``cpu=8,mem=64G,gres/gpu=2``."""
+    match = re.search(rf"(?:^|,){re.escape(name)}=([^,]+)", tres)
+    return match.group(1) if match else None
+
+
+def mem_to_mb(text):
+    """``48G`` / ``4000000M`` / ``7812.50G`` / ``2T`` to megabytes."""
+    match = re.fullmatch(r"([0-9.]+)([KMGT]?)", text.strip())
+    if not match:
+        return None
+    value = float(match.group(1))
+    scale = {"": 1, "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}[match.group(2)]
+    return int(value * scale)
+
+
+def alloc_gpu_count(tres):
+    """GPUs in a TRES string, counting the typed form (``gres/gpu:a40=1``) too."""
+    total = tres_field(tres, "gres/gpu")
+    if total is not None and total.isdigit():
+        return int(total)
+    typed = re.findall(r"(?:^|,)gres/gpu:[^=,]+=(\d+)", tres)
+    return sum(int(n) for n in typed)
+
+
+def reserved_for_others():
+    """Nodes held by an active reservation that none of LAB_ACCOUNTS may use.
+
+    sinfo only reports a reserved node as ``resv`` while it is idle; once any job
+    runs on it the state reads plain ``mix``, so without this a node like
+    udc-ba07-38 (reservation dac_ssz, one CPU in use, eight idle A40s) looks
+    wide open. Returns ``{node: reservation name}``.
+
+    Access is judged by account only. A reservation granted to users or groups
+    (maintenance windows held for root, say) is treated as closed, and
+    ``Accounts=-name`` is SLURM's "everyone except" form.
+    """
+    locked = {}
+    for row in parse_cmd("scontrol show reservation -o"):
+        fields = dict(
+            token.split("=", 1) for token in row.split() if "=" in token
+        )
+        name = fields.get("ReservationName", "?")
+        if fields.get("State") != "ACTIVE":
+            continue
+        nodes = fields.get("Nodes", "(null)")
+        if nodes in ("", "(null)"):
+            print(f"Warning: active reservation {name} names no nodes, ignoring it")
+            continue
+        accounts = fields.get("Accounts", "(null)")
+        listed = set() if accounts == "(null)" else set(accounts.lstrip("-").split(","))
+        if accounts.startswith("-"):
+            ours = not (listed & set(LAB_ACCOUNTS))
+        else:
+            ours = bool(listed & set(LAB_ACCOUNTS))
+        if ours:
+            continue
+        for node in parse_node_names(nodes):
+            # A node in two closed reservations just keeps the first name.
+            locked.setdefault(node, name)
+    return locked
 
 
 @beartype
@@ -521,182 +423,88 @@ def node_states(partition: Optional[str] = None) -> dict:
     return states
 
 
-@beartype
-def get_gpu_partitions(keywords=['gpu', 'ddp']) -> list:
-    """Query SLURM for the supported partitions.
-
-    Args:
-        keywords: the keywords to indicate gpu partitions (comma separated) of interest.
-
-    Returns:
-        a list of requested SLURM partitions.
-    """
-    cmd = "sinfo -a --noheader"
-    rows = parse_cmd(cmd)
-    partitions = set()
-    for row in rows:
-        par = row.split()[0]
-        if any([k in par for k in keywords]):
-            partitions.add(par)
-    return sorted(list(partitions))
-
-
-@functools.lru_cache(maxsize=64, typed=True)
-def occupancy_stats_for_node(node: str) -> dict:
-    """Query SLURM for the occupancy of a given node.
-
-    Args:
-        (node): the name of the node to query
-
-    Returns:
-        a mapping between node names and occupancy stats.
-    """
-    cmd = f"scontrol show node {node}"
-    rows = [x.strip() for x in parse_cmd(cmd)]
-    keys = ("AllocTRES", "CfgTRES")
-    metrics = {}
-    for row in rows:
-        for key in keys:
-            if row.startswith(key):
-                row = row.replace(f"{key}=", "")
-                tokens = row.split(",")
-                if tokens == [""]:
-                    # SLURM sometimes omits information, so we alert the user to its
-                    # its exclusion and report nothing for this node
-                    print(f"Missing information for {node}: {key}, skipping....")
-                    metrics[key] = {}
-                else:
-                    metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1] 
-                                   for token in tokens if "=" in token}
-    occupancy = {}
-    for metric, alloc_val in metrics["AllocTRES"].items():
-        cfg_val = metrics["CfgTRES"][metric]
-        if metric == "mem":
-            # SLURM appears to sometimes misformat large numbers, producing summary strings
-            # like 68G/257669M, rather than 68G/258G. The humanfriendly library provides
-            # a more reliable number parser, and the humanize library provides a nice
-            # formatter.
-            alloc_val = format_size(hf.parse_size(alloc_val,binary=True))
-            cfg_val = format_size(hf.parse_size(cfg_val,binary=True))
-        occupancy[metric] = f"{alloc_val}/{cfg_val}"
-    return occupancy
-
 def format_size(size_in_bytes):
     """Format size in bytes to human readable string (G or T)."""
-    size_in_gb = size_in_bytes / (1024 ** 3)  
-    if size_in_gb < 1024: 
+    size_in_gb = size_in_bytes / (1024 ** 3)
+    if size_in_gb < 1024:
         return f"{int(size_in_gb)} G"
-    
+
     size_in_tb = size_in_gb / 1024
     formatted_tb = f"{size_in_tb:.1f}".rstrip('0').rstrip('.')
     return f"{formatted_tb} T"
 
-def lru_cache_time(seconds, maxsize=None):
-    """
-    Adds time aware caching to lru_cache.
 
-    https://stackoverflow.com/questions/31771286/python-in-memory-cache-with-time-to-live
-    """
-    def wrapper(func):
-        # Lazy function that makes sure the lru_cache() invalidate after X secs
-        ttl_hash = lazy(lambda: round(time.time() / seconds), int)()
-        
-        @functools.lru_cache(maxsize)
-        def time_aware(__ttl, *args, **kwargs):
-            """
-            Main wrapper, note that the first argument ttl is not passed down. 
-            This is because no function should bother to know this that 
-            this is here.
-            """
-            def wrapping(*args, **kwargs):
-                return func(*args, **kwargs)
-            return wrapping(*args, **kwargs)
-        return functools.update_wrapper(functools.partial(time_aware, ttl_hash), func)
-    return wrapper
-
-
-def _tres_occupancy(node: str, rows: list) -> dict:
-    """Free/total cpu and mem for one `scontrol show node` record."""
-    keys = ("AllocTRES", "CfgTRES")
-    metrics = {}
-    for row in rows:
-        for key in keys:
-            if row.startswith(key):
-                row = row.replace(f"{key}=", "")
-                tokens = row.split(",")
-                if tokens == [""]:
-                    # SLURM sometimes omits information, so we alert the user to its
-                    # its exclusion and report nothing for this node
-                    # print(f"Missing information for {node}: {key}, skipping....")
-                    metrics[key] = {}
-                else:
-                    metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1]
-                                   for token in tokens if "=" in token}
-    if "CfgTRES" not in metrics or "AllocTRES" not in metrics:
-        print(f"Warning: node {node} reported no TRES totals, showing it as empty")
-        return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
-    occupancy = {}
-    for metric, cfg_val in metrics["CfgTRES"].items():
-        try:
-            alloc_val = metrics["AllocTRES"][metric]
-        except KeyError:
-            alloc_val = '0'
-        if metric == "mem":
-            # SLURM appears to sometimes misformat large numbers, producing summary strings
-            # like 68G/257669M, rather than 68G/258G. The humanfriendly library provides
-            # a more reliable number parser, and the humanize library provides a nice
-            # formatter.
-            avail_val = format_size(hf.parse_size(cfg_val,binary=True) - hf.parse_size(alloc_val,binary=True))
-            cfg_val = format_size(hf.parse_size(cfg_val,binary=True))
-            occupancy[metric] = f"{avail_val} / {cfg_val}"
-        else:
-            occupancy[metric] = f"{hf.parse_size(cfg_val)-hf.parse_size(alloc_val)} / {hf.parse_size(cfg_val)}"
-    return occupancy
-
-
-@lru_cache_time(seconds=10)
-def _avail_stats_by_node() -> dict:
-    """Availability for every node on the cluster, from a single scontrol call.
+@ttl_cache(10)
+def node_records() -> dict:
+    """``{node: {key: value}}`` for every node, from a single `scontrol show node`.
 
     Asking node by node costs one RPC each, and the resource panel walks about a
     hundred GPU nodes, so that alone was several seconds of every page refresh.
     One `scontrol show node` returns all of them in about the time a single-node
     query takes, so read the whole table once and let callers index into it.
-    Records start at an unindented NodeName=; every other line is indented.
+    Records start at an unindented NodeName=; every other line is indented. Values
+    are the raw strings up to the next space, which covers every key read here
+    (OS= and Reason=, which hold spaces, keep only their first word).
     """
     try:
         rows = parse_cmd("scontrol show node")
     except (subprocess.CalledProcessError, OSError) as exc:
         print(f"Warning: could not read the node table ({exc}), showing every node as empty")
         return {}
-    records, node = {}, None
+    records, record = {}, None
     for row in rows:
         if row.startswith("NodeName="):
-            node = row.split()[0].split("=", 1)[1]
-            records[node] = []
-        elif node is not None:
-            records[node].append(row.strip())
-        else:
+            record = records.setdefault(row.split()[0].split("=", 1)[1], {})
+        elif record is None:
             print(f"Warning: line before any NodeName= in scontrol output, ignoring it: {row.strip()!r}")
-    return {name: _tres_occupancy(name, rows) for name, rows in records.items()}
+            continue
+        for token in row.split():
+            key, sep, value = token.partition("=")
+            if sep:
+                record.setdefault(key, value)
+    return records
+
+
+def _tres_dict(text):
+    """``cpu=8,mem=64G`` -> ``{"cpu": "8", "mem": "64G"}``."""
+    return dict(token.split("=", 1) for token in text.split(",") if "=" in token)
 
 
 def avail_stats_for_node(node: str) -> dict:
-    """Query SLURM for the availability of a given node.
+    """Free and total CPUs and memory of one node.
 
-    Args:
-        (node): the name of the node to query
-
-    Returns:
-        a mapping between node names and availability stats.
+    Returns ``{"cpu": (free, total), "mem": (free bytes, total bytes)}``. SLURM
+    sometimes writes large memory sizes oddly (68G next to 257669M), so they go
+    through humanfriendly's parser rather than being compared as text.
     """
-    stats = _avail_stats_by_node().get(node)
-    if stats is None:
+    record = node_records().get(node)
+    if record is None:
         print(f"Warning: no scontrol record for node {node}, showing it as empty")
-        return {"cpu": "0 / 0", "mem": "0 G / 0 G"}
-    # The cache hands out one dict per node, so copy it rather than let a caller
-    # edit what the next caller will read.
-    return dict(stats)
+        return {"cpu": (0, 0), "mem": (0, 0)}
+    if "CfgTRES" not in record or "AllocTRES" not in record:
+        print(f"Warning: node {node} reported no TRES totals, showing it as empty")
+        return {"cpu": (0, 0), "mem": (0, 0)}
+    cfg, alloc = _tres_dict(record["CfgTRES"]), _tres_dict(record["AllocTRES"])
+    stats = {}
+    for metric in ("cpu", "mem"):
+        total = hf.parse_size(cfg[metric], binary=metric == "mem")
+        used = hf.parse_size(alloc.get(metric, "0"), binary=metric == "mem")
+        stats[metric] = (total - used, total)
+    return stats
+
+
+def occupancy_stats_for_node(node: str) -> dict:
+    """Allocated/total of every TRES SLURM tracks on ``node``, as display strings."""
+    record = node_records().get(node, {})
+    cfg = _tres_dict(record.get("CfgTRES", ""))
+    occupancy = {}
+    for metric, alloc_val in _tres_dict(record.get("AllocTRES", "")).items():
+        cfg_val = cfg[metric]
+        if metric == "mem":
+            alloc_val = format_size(hf.parse_size(alloc_val, binary=True))
+            cfg_val = format_size(hf.parse_size(cfg_val, binary=True))
+        occupancy[metric] = f"{alloc_val}/{cfg_val}"
+    return occupancy
 
 
 @beartype
@@ -716,7 +524,7 @@ def parse_all_gpus(partition: Optional[str] = None,
     Returns:
         a mapping between node names and a list of the GPUs that they have available.
     """
-    cmd = "sinfo -o '%5000N|%5000G' --noheader"
+    cmd = "sinfo -o '%N|%G' --noheader"
     if partition:
         cmd += f" --partition={partition}"
     else:
@@ -724,22 +532,13 @@ def parse_all_gpus(partition: Optional[str] = None,
     rows = parse_cmd(cmd)
     resources = defaultdict(list)
 
-    # Debug the regular expression below at
-    # https://regex101.com/r/RHYM8Z/3
-    # Updated regex to support MIG GPU types like "1g.10gb" which contain dots
-    p = re.compile(r'gpu:(?:([^:]*):)?(\d*)(?:\(\S*\))?\s*')
-
     for row in rows:
         node_str, resource_strs = row.split("|")
-        for resource_str in resource_strs.split(","):
-            if not resource_str.startswith("gpu"):
-                continue
-            match = p.search(resource_str)
-            gpu_type = match.group(1) if match.group(1) is not None else default_gpu_name
+        for gpu_type, gpu_count in parse_gres_gpus(resource_strs):
+            gpu_type = gpu_type or default_gpu_name
             # if the number of GPUs is not specified, we assume it is `default_gpus`
-            gpu_count = int(match.group(2)) if match.group(2) != "" else default_gpus
-            node_names = parse_node_names(node_str)
-            for name in node_names:
+            gpu_count = default_gpus if gpu_count is None else gpu_count
+            for name in parse_node_names(node_str):
                 resources[name].append({"type": gpu_type, "count": gpu_count})
     return resources
 
@@ -803,29 +602,12 @@ def summary(mode: str, resources: dict = None, states: dict = None):
 
 
 @functools.lru_cache(maxsize=1)
-def _get_slurm_version():
-    return parse_cmd("sinfo -V", split=False).split(" ")[1]
-
-
-def _gpus_per_node_from_alloc(extra_tokens: list, jobid: str) -> int:
+def _gpus_per_node_from_alloc(num_nodes: str, tres_alloc: str, jobid: str) -> int:
     """GPUs per node for a job whose tres-per-node names none.
 
-    ``extra_tokens`` is ``[NumNodes, tres-alloc]``, or empty on SLURM before 21
-    where those columns are not asked for. tres-alloc's ``gres/gpu=N`` is the
-    job's total over all its nodes.
+    tres-alloc's ``gres/gpu=N`` is the job's total over all its nodes.
     """
-    if not extra_tokens:
-        return 0
-    if len(extra_tokens) != 2:
-        print(f"Warning: job {jobid} has unexpected NumNodes/tres-alloc {extra_tokens!r}, "
-              "not counting its GPUs")
-        return 0
-    num_nodes, tres_alloc = extra_tokens
-    total = 0
-    for item in tres_alloc.split(","):
-        key, _, val = item.partition("=")
-        if key == "gres/gpu":
-            total = int(val)
+    total = alloc_gpu_count(tres_alloc)
     nodes = int(num_nodes)
     if total % nodes:
         print(f"Warning: job {jobid} holds {total} GPUs over {nodes} nodes, "
@@ -843,80 +625,44 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
     Returns:
         (dict): a summary of resources organised by user (and also by node name).
     """
-    slurm_version = _get_slurm_version()
-    if slurm_version.startswith("17"):
-       resource_flag = "gres"
-    else:
-       resource_flag = "tres-per-node"
-
-    if int(slurm_version[0:2]) >= 21:
-        gpu_identifier = 'gres/gpu'
-    else:
-        gpu_identifier = 'gpu'
-
-    columns = [resource_flag, "nodelist", "username", "jobid", "BatchFlag"]
-    if int(slurm_version[0:2]) >= 21:
-        # A job that asks with --gpus or --gpus-per-task has no tres-per-node;
-        # its GPUs only show up in its allocation.
-        columns += ["NumNodes", "tres-alloc"]
-    # RUNNING only: a COMPLETING job still lists its nodes, but SLURM has
-    # already given its GPUs back to the node and to the user's QOS limit.
-    args = "-a -t RUNNING --noheader"
-    if partition:
-        args += f" --partition={partition}"
     usage = defaultdict(dict)
     # Tallied and reported once below rather than per job: these skips are routine
     # (CPU-only jobs, drained nodes) and a refresh walks hundreds of jobs.
     no_gpu_jobs = 0
     off_inventory = defaultdict(int)  # node -> GPUs held there that go uncounted
-    for job in squeue_fields(args, columns):
-        gpu_count_str, node_str, user, jobid, batch_flag = (job[c] for c in columns[:5])
-        if gpu_count_str.startswith(gpu_identifier):
-            gpu_count_tokens = gpu_count_str.split(":")
-            if not gpu_count_tokens[-1].isdigit():
-                gpu_count_tokens.append("1")
+    # RUNNING only: a COMPLETING job still lists its nodes, but SLURM has
+    # already given its GPUs back to the node and to the user's QOS limit.
+    for job in squeue_jobs("RUNNING", partition):
+        user, jobid = job["username"], job["jobid"]
+        if job["tres-per-node"].startswith("gres/gpu"):
+            # gres/gpu:N or gres/gpu:<type>:N; a bare gres/gpu means one
+            count = job["tres-per-node"].split(":")[-1]
+            num_gpus = int(count) if count.isdigit() else 1
         else:
-            per_node = _gpus_per_node_from_alloc([job[c] for c in columns[5:]], jobid)
+            # A job that asks with --gpus or --gpus-per-task has no tres-per-node; its
+            # GPUs only show up in its allocation.
+            num_gpus = _gpus_per_node_from_alloc(job["numnodes"], job["tres-alloc"], jobid)
             # A CPU-only job (e.g. on the dedicated nodes) holds no GPU to count
-            if not per_node:
+            if not num_gpus:
                 no_gpu_jobs += 1
                 continue
-            gpu_count_tokens = [gpu_identifier, str(per_node)]
-        num_gpus = int(gpu_count_tokens[-1])
-        is_bash = batch_flag.strip() == "0"
-        num_bash_gpus = num_gpus * is_bash
-        node_names = parse_node_names(node_str)
-        for node_name in node_names:
+        num_bash_gpus = num_gpus * (job["batchflag"] == "0")
+        for node_name in parse_node_names(job["nodelist"]):
             # If a node still has jobs running but is draining, it will not be present
             # in the "available" resources, so we ignore it
             if node_name not in resources:
                 off_inventory[node_name] += num_gpus
                 continue
-            node_gpu_types = [x["type"] for x in resources[node_name]]
-            if (len(gpu_count_tokens) == 2) or (int(slurm_version[0:2]) >= 21):
-                gpu_type = None
-            elif len(gpu_count_tokens) == 3:
-                gpu_type = gpu_count_tokens[1]
-            if gpu_type is None:
-                if len(node_gpu_types) != 1:
-                    gpu_type = sorted(
-                        resources[node_name],
-                        key=lambda k: k['count'],
-                        reverse=True
-                    )[0]['type']
-                    msg = (f"cannot determine node gpu type for {user} on {node_name}"
-                           f" (guessing {gpu_type})")
-                    print(f"WARNING >>> {msg}")
-                else:
-                    gpu_type = node_gpu_types[0]
-            if gpu_type in usage[user]:
-                usage[user][gpu_type][node_name]['n_gpu'] += num_gpus
-                usage[user][gpu_type][node_name]['bash_gpu'] += num_bash_gpus
-
-            else:
-                usage[user][gpu_type] = defaultdict(lambda: {'n_gpu': 0, 'bash_gpu': 0})
-                usage[user][gpu_type][node_name]['n_gpu'] += num_gpus
-                usage[user][gpu_type][node_name]['bash_gpu'] += num_bash_gpus
+            # The type comes from the node: a request need not name one.
+            node_gpus = resources[node_name]
+            gpu_type = max(node_gpus, key=lambda k: k["count"])["type"]
+            if len(node_gpus) != 1:
+                print(f"WARNING >>> cannot determine node gpu type for {user} on {node_name}"
+                      f" (guessing {gpu_type})")
+            counts = usage[user].setdefault(
+                gpu_type, defaultdict(lambda: {'n_gpu': 0, 'bash_gpu': 0}))[node_name]
+            counts['n_gpu'] += num_gpus
+            counts['bash_gpu'] += num_bash_gpus
 
     if no_gpu_jobs:
         print(f"Note: gpu_usage skipped {no_gpu_jobs} running jobs that hold no GPU")
@@ -928,6 +674,34 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
     return usage
 
 
+def aggregate_usage(usage: dict) -> dict:
+    """Fold gpu_usage's per-node counts into per-user totals by GPU type.
+
+    Returns ``{user: {"n_gpu": {type: n}, "bash_gpu": {type: n}}}``.
+    """
+    return {
+        user: {
+            field: {gpu_type: sum(x[field] for x in nodes.values())
+                    for gpu_type, nodes in by_type.items()}
+            for field in ("n_gpu", "bash_gpu")
+        }
+        for user, by_type in usage.items()
+    }
+
+
+def subtract_usage(resources: dict, usage: dict) -> None:
+    """Take the GPUs in ``usage`` off the per-node counts in ``resources``, in place.
+
+    A node never drops below zero: GPUs held past its count are shared ones.
+    """
+    for subdict in usage.values():
+        for gpu_type, node_dicts in subdict.items():
+            for node_name, user_gpu_count in node_dicts.items():
+                resource_idx = [x["type"] for x in resources[node_name]].index(gpu_type)
+                count = resources[node_name][resource_idx]["count"]
+                resources[node_name][resource_idx]["count"] = max(count - user_gpu_count["n_gpu"], 0)
+
+
 @beartype
 def in_use(resources: dict = None, partition: Optional[str] = None):
     """Print a short summary of the resources that are currently used by each user.
@@ -937,14 +711,7 @@ def in_use(resources: dict = None, partition: Optional[str] = None):
     """
     if not resources:
         resources = parse_all_gpus()
-    usage = gpu_usage(resources, partition=partition)
-    aggregates = {}
-    for user, subdict in usage.items():
-        aggregates[user] = {}
-        aggregates[user]['n_gpu'] = {key: sum([x['n_gpu'] for x in val.values()])
-                                     for key, val in subdict.items()}
-        aggregates[user]['bash_gpu'] = {key: sum([x['bash_gpu'] for x in val.values()])
-                                        for key, val in subdict.items()}
+    aggregates = aggregate_usage(gpu_usage(resources, partition=partition))
     print("Usage by user:")
     for user, subdict in sorted(aggregates.items(),
                                 key=lambda x: sum(x[1]['n_gpu'].values())):
@@ -981,13 +748,7 @@ def available(
     res = {key: val for key, val in resources.items()
            if not is_inaccessible(states.get(key, "down"))}
     usage = gpu_usage(resources=res)
-    for subdict in usage.values():
-        for gpu_type, node_dicts in subdict.items():
-            for node_name, user_gpu_count in node_dicts.items():
-                resource_idx = [x["type"] for x in res[node_name]].index(gpu_type)
-                count = res[node_name][resource_idx]["count"]
-                count = max(count - user_gpu_count['n_gpu'], 0)
-                res[node_name][resource_idx]["count"] = count
+    subtract_usage(res, usage)
     by_type = resource_by_type(res)
     total = sum(x["count"] for sublist in by_type.values() for x in sublist)
     print(f"There are {total} gpus available:")
@@ -1031,46 +792,15 @@ def all_info(color: int, verbose: bool, partition: Optional[str] = None):
 
 def main():
     parser = argparse.ArgumentParser(description="slurm_gpus tool")
-    parser.add_argument("--action", default="current",
-                        choices=["current", "history", "daemon-start", "daemon-stop"],
-                        help=("The function performed by slurm_gpustat: `current` will"
-                              " provide a summary of current usage, 'history' will "
-                              "provide statistics from historical data (provided that the"
-                              "logging daemon has been running). 'daemon-start' and"
-                              "'daemon-stop' will start and stop the daemon, resp."))
     parser.add_argument("-p", "--partition", default=None,
                         help=("the partition/queue (or multiple, comma separated) of"
                               " interest. By default set to all available partitions."))
-    parser.add_argument("--log_path",
-                        default=Path.home() / "data/daemons/logs/slurm_gpustat.log",
-                        help="the location where daemon log files will be stored")
-    parser.add_argument("--gpustat_pid",
-                        default=Path.home() / "data/daemons/pids/slurm_gpustat.pid",
-                        help="the location where the daemon PID file will be stored")
-    parser.add_argument("--daemon_log_interval", type=int, default=43200,
-                        help="time interval (secs) between stat logging (default 12 hrs)")
     parser.add_argument("--color", type=int, default=1, help="color output")
     parser.add_argument("--verbose", action="store_true",
                         help="provide a more detailed breakdown of resources")
     args = parser.parse_args()
 
-    if args.action == "current":
-        all_info(color=args.color, verbose=args.verbose, partition=args.partition)
-    elif args.action == "history":
-        data = GPUStatDaemon.deserialize_usage(args.log_path)
-        historical_summary(data)
-    elif args.action.startswith("daemon"):
-        daemon = GPUStatDaemon(
-            log_path=args.log_path,
-            pidfile=args.gpustat_pid,
-            log_interval=args.daemon_log_interval,
-        )
-        if args.action == "daemon-start":
-            print("Starting daemon")
-            daemon.start()
-        elif args.action == "daemon-stop":
-            print("Stopping daemon")
-            daemon.stop()
+    all_info(color=args.color, verbose=args.verbose, partition=args.partition)
 
 
 if __name__ == "__main__":

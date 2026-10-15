@@ -1,9 +1,7 @@
 numpy
 beartype
 colored
-django
 flask
 humanfriendly
-humanize
 pandas
 pytz

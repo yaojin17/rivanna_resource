@@ -69,7 +69,12 @@ python available_resources.py    # only what is free
   free GPUs were overstated before. Job node lists are now read from `squeue` in full,
   so a very long one cannot break those panels, and `available_resources.py` covers
   every monitored partition and leaves out drained nodes and ones reserved for other
-  groups.
+  groups. Estimated Wait runs its SLURM queries side by side (about twice as fast from
+  cold), `available_resources.py` reads the node table once instead of once per node,
+  and the app no longer needs django or humanize. The panels share one `squeue` read
+  per job state, and Queue Overview now counts every task of a pending array with a
+  long task list, which the old read cut short. `slurm_gpustat.py` drops its unused
+  usage-logging daemon (`--action`).
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts
