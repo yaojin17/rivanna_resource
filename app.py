@@ -2370,11 +2370,19 @@ def _gpu_type_on_nodes(jobid, node_str, inventory):
 
     A job sent to a mixed partition such as ``gpu`` without naming a type has no
     type anywhere in squeue; only the node it landed on tells. ``inventory`` is
-    :func:`parse_all_gpus` output. Returns ``?`` when a node is missing from it,
-    and every type joined with ``/`` when the nodes offer more than one, since
-    the job's own share cannot be told apart then.
+    :func:`parse_all_gpus` output. Returns ``?`` when the node list is missing or
+    cut off, or a node is missing from the inventory, and every type joined with
+    ``/`` when the nodes offer more than one, since the job's own share cannot be
+    told apart then.
     """
-    nodes = parse_node_names(node_str) if node_str else []
+    try:
+        nodes = parse_node_names(node_str) if node_str else []
+    except ValueError as err:
+        # squeue -O cuts a field at its width without a word, so a long node list
+        # can end inside its brackets.
+        print(f"Warning: cannot parse node list {node_str!r} of job {jobid} ({err}); "
+              "type shown as ?")
+        return "?"
     if not nodes:
         print(f"Warning: GPU job {jobid} has no node list; type shown as ?")
         return "?"

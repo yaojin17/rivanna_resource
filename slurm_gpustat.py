@@ -846,6 +846,10 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
         cmd += f" --partition={partition}"
     rows = parse_cmd(cmd)
     usage = defaultdict(dict)
+    # Tallied and reported once below rather than per job: these skips are routine
+    # (CPU-only jobs, drained nodes) and a refresh walks hundreds of jobs.
+    no_gpu_jobs = 0
+    off_inventory = defaultdict(int)  # node -> GPUs held there that go uncounted
     for row in rows:
         tokens = row.split()
         if len(tokens) < 5:
@@ -860,6 +864,7 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
             per_node = _gpus_per_node_from_alloc(tokens[5:], jobid)
             # A CPU-only job (e.g. on the dedicated nodes) holds no GPU to count
             if not per_node:
+                no_gpu_jobs += 1
                 continue
             gpu_count_tokens = [gpu_identifier, str(per_node)]
         num_gpus = int(gpu_count_tokens[-1])
@@ -870,6 +875,7 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
             # If a node still has jobs running but is draining, it will not be present
             # in the "available" resources, so we ignore it
             if node_name not in resources:
+                off_inventory[node_name] += num_gpus
                 continue
             node_gpu_types = [x["type"] for x in resources[node_name]]
             if (len(gpu_count_tokens) == 2) or (int(slurm_version[0:2]) >= 21):
@@ -897,6 +903,13 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
                 usage[user][gpu_type][node_name]['n_gpu'] += num_gpus
                 usage[user][gpu_type][node_name]['bash_gpu'] += num_bash_gpus
 
+    if no_gpu_jobs:
+        print(f"Note: gpu_usage skipped {no_gpu_jobs} running jobs that hold no GPU")
+    if off_inventory:
+        nodes = sorted(off_inventory)
+        shown = ", ".join(nodes[:5]) + (f" and {len(nodes) - 5} more" if len(nodes) > 5 else "")
+        print(f"Warning: gpu_usage left out {sum(off_inventory.values())} GPUs held on "
+              f"{len(nodes)} nodes outside the inventory it was given ({shown})")
     return usage
 
 

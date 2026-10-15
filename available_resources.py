@@ -1,6 +1,9 @@
 import subprocess
 import re
 import itertools
+# Before pandas: importing slurm_gpustat pins the BLAS thread pools, which only
+# takes effect if numpy has not been loaded yet.
+from slurm_gpustat import MONITORED_PARTITIONS, parse_node_names
 import pandas as pd
 
 def get_node_names(partition_name):
@@ -20,29 +23,9 @@ def get_node_names(partition_name):
             if len(parts) >= 5:
                 nodelist = parts[-1]
                 # Process node list (e.g., udc-an38-[1,9,13,17,25,29,33])
-                expanded_nodes = expand_nodelist(nodelist)
-                node_names.update(expanded_nodes)
+                node_names.update(parse_node_names(nodelist))
     
     return list(node_names)
-
-def expand_nodelist(nodelist):
-    # Use regex to expand node list
-    expanded_nodes = []
-    pattern = re.compile(r'([a-zA-Z\-\d]+)\[(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)\]')
-    matches = pattern.findall(nodelist)
-    if matches:
-        for match in matches:
-            prefix, ids = match
-            for part in ids.split(','):
-                if '-' in part:
-                    start, end = map(int, part.split('-'))
-                    expanded_nodes.extend([f"{prefix}{i}" for i in range(start, end + 1)])
-                else:
-                    expanded_nodes.append(f"{prefix}{part}")
-    else:
-        expanded_nodes.append(nodelist)
-    
-    return expanded_nodes
 
 def get_node_resources(node_name):
     # Get node resource information
@@ -59,7 +42,7 @@ def get_node_resources(node_name):
     mem_alloc_match = re.search(r'AllocMem=(\d+)', result.stdout)
     mem_total_match = re.search(r'RealMemory=(\d+)', result.stdout)
     gpu_alloc_match = re.search(r'AllocTRES=.*gres/gpu=(\d+)', result.stdout)
-    gpu_total_match = re.findall(r'Gres=gpu:(\w+(?:-\d+)?):\d+', result.stdout)
+    gpu_total_match = re.search(r'Gres=gpu:[^:\s]+:(\d+)', result.stdout)
     available_features_match = re.search(r'AvailableFeatures=([\w,]+)', result.stdout)
 
     cpus_total = int(cpu_total_match.group(1)) if cpu_total_match else None
@@ -76,10 +59,8 @@ def get_node_resources(node_name):
     if available_features_match:
         gpu_type = available_features_match.group(1).split(',')
     if gpu_total_match:
-        for gpu in gpu_total_match:
-            gpu_model = gpu
-            gpus_alloc = int(gpu_alloc_match.group(1)) if gpu_alloc_match else 0
-            gpus_available += 8 - gpus_alloc if gpus_alloc is not None else 8
+        gpus_alloc = int(gpu_alloc_match.group(1)) if gpu_alloc_match else 0
+        gpus_available = int(gpu_total_match.group(1)) - gpus_alloc
     gpu_type = [tp for tp in gpu_type if "gb" in tp] if len(gpu_type) > 1 else gpu_type
     gpu_type_str = ", ".join(gpu_type) if gpu_type else None
 
@@ -92,21 +73,23 @@ def get_node_resources(node_name):
     }
 
 def main():
-    partitions = ["gpu-a6000", "gpu-a100-80", "gpu-a100-40", "gpu-a40", "gpu-v100", "interactive-rtx3090", "interactive-rtx2080", "gpu-h200",]
-    all_resources = []
-    
-    for partition_name in partitions:
+    # Gather the nodes first: the union partitions (gpu, interactive) hold the same
+    # nodes as the typed ones, so checking partition by partition would list them twice.
+    all_nodes = set()
+    for partition_name in MONITORED_PARTITIONS.split(","):
         print(f"Checking partition: {partition_name}")
         node_names = get_node_names(partition_name)
 
         if not node_names:
             print("No nodes found for partition:", partition_name)
             continue
+        all_nodes.update(node_names)
 
-        for node in node_names:
-            resources = get_node_resources(node)
-            if resources:
-                all_resources.append(resources)
+    all_resources = []
+    for node in sorted(all_nodes):
+        resources = get_node_resources(node)
+        if resources:
+            all_resources.append(resources)
     
     if all_resources:
         df = pd.DataFrame(all_resources)

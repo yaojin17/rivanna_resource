@@ -102,6 +102,9 @@ nodes. The last line totals the account's running jobs and GPUs.
 `GPU_TYPE` is the GPU type of the node the job landed on (`-` for CPU-only jobs). A job
 sent to a mixed partition such as `gpu` without naming a type shows only `gpu` under
 `PARTITION`; this column tells you whether it got, say, an A100 or an RTX PRO 6000.
+`a40/a100` means the job's nodes offer more than one type, so which one it holds cannot
+be told from the nodes. `?` means the type could not be looked up: the node list is
+missing or was cut off by `squeue`, or a node lists no GPUs.
 
 ## Waiting Queue
 
