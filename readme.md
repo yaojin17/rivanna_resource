@@ -84,7 +84,11 @@ python available_resources.py    # only what is free
   instead of failing as a whole; *Update All* counts a panel the server could not
   build as failed; `slurm_gpustat.py`'s accessible and available summaries leave out
   nodes reserved for other groups, like the page; and the app refuses to start with a
-  malformed name in `RIVANNA_ACCOUNTS`.
+  malformed name in `RIVANNA_ACCOUNTS`. `slurm_gpustat.py` counts a job's GPUs on the
+  nodes it runs on, whichever partition it was sent to: `-p` no longer warns about
+  GPUs held on other nodes, and GPUs held by jobs from unmonitored partitions such as
+  `bii-gpu` no longer show as available. Estimated Wait assumes a running job with no
+  time limit keeps its share for the whole replay instead of warning on every refresh.
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts

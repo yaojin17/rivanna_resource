@@ -83,6 +83,8 @@ replays the scheduler for one GPU pool, placing every job ranked above yours fir
 - `Worst Case`: every job runs to its time limit.
 - `Typical`: every job runs for the fraction of its limit that jobs in that partition
   really used over the last 3 days.
+- A running job with no time limit is assumed to keep what it holds for the whole
+  30 days the replay looks ahead.
 
 ## Priority in Each Pool
 

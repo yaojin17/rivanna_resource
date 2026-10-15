@@ -1102,9 +1102,11 @@ def _running_jobs_by_node(rows, now, max_minutes):
 
     Each allocation carries what the job holds on *that* node (a multi-node job
     is split evenly), when SLURM will kill it, and how much of its limit it has
-    already used so the Typical estimate can shorten it.
+    already used so the Typical estimate can shorten it. A job with no time
+    limit has no end (None): nothing says when it lets go of its share.
     """
     by_node = defaultdict(list)
+    no_limit = []
     for row in rows:
         nodes = parse_node_names(row["nodelist"]) if row["nodelist"] else []
         if not nodes:
@@ -1113,7 +1115,10 @@ def _running_jobs_by_node(rows, now, max_minutes):
         n_nodes = len(nodes)
         held = _row_alloc(row, max_minutes, "job")
         limit = held["minutes"]
-        if row["endtime"] in ("N/A", "UNKNOWN", ""):
+        if row["endtime"] == "NONE" and row["timelimit"] in ("UNLIMITED", "INFINITE"):
+            no_limit.append(row["jobid"])
+            end = None
+        elif row["endtime"] in ("N/A", "UNKNOWN", ""):
             print(f"Warning: running job {row['jobid']} has no end time, assuming its full limit")
             end = now + timedelta(minutes=limit)
         else:
@@ -1134,6 +1139,9 @@ def _running_jobs_by_node(rows, now, max_minutes):
         }
         for node in nodes:
             by_node[node].append(alloc)
+    if no_limit:
+        print(f"Note: running jobs with no time limit ({', '.join(no_limit)}) keep what they "
+              f"hold for all {PLAN_HORIZON_DAYS} days of the wait replay")
     return by_node
 
 
@@ -1227,13 +1235,17 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
         if node not in index:
             continue
         for alloc in allocs:
-            remaining = (alloc["end"] - now).total_seconds() / 60
-            if ratio is not None:
-                elapsed = alloc["limit"] - remaining
-                expected = alloc["limit"] * ratio
-                # Past its usual length already: assume half of what is left.
-                remaining = expected - elapsed if elapsed < expected else remaining / 2
-            end = min(_bucket_span(max(remaining, 1)), buckets)
+            if alloc["end"] is None:
+                # No time limit: its share stays taken for the whole horizon.
+                end = buckets
+            else:
+                remaining = (alloc["end"] - now).total_seconds() / 60
+                if ratio is not None:
+                    elapsed = alloc["limit"] - remaining
+                    expected = alloc["limit"] * ratio
+                    # Past its usual length already: assume half of what is left.
+                    remaining = expected - elapsed if elapsed < expected else remaining / 2
+                end = min(_bucket_span(max(remaining, 1)), buckets)
             avail[:, index[node], :end] -= np.array(
                 (alloc["gpus"], alloc["cpus"], alloc["mem_mb"]), dtype=np.int64
             )[:, None]

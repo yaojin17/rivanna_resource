@@ -748,13 +748,13 @@ def subtract_usage(resources: dict, usage: dict) -> None:
 
 
 @beartype
-def in_use(resources: dict, partition: Optional[str] = None):
+def in_use(usage: dict):
     """Print a short summary of the resources that are currently used by each user.
 
     Args:
-        resources: a summary of cluster resources, organised by node name.
+        usage: gpu_usage's per-user, per-node GPU counts.
     """
-    aggregates = aggregate_usage(gpu_usage(resources, partition=partition))
+    aggregates = aggregate_usage(usage)
     print("Usage by user:")
     for user, subdict in sorted(aggregates.items(),
                                 key=lambda x: sum(x[1]['n_gpu'].values())):
@@ -765,13 +765,13 @@ def in_use(resources: dict, partition: Optional[str] = None):
 
 
 @beartype
-def available(res: dict, excluded: dict, verbose: bool = False):
+def available(res: dict, usage: dict, verbose: bool = False):
     """Print a short summary of resources available on the cluster.
 
     Args:
         res: the accessible nodes' resources, organised by node name; the GPUs in
             use are subtracted from it in place.
-        excluded: why each node left out of ``res`` was, see gpu_usage.
+        usage: gpu_usage's counts, which may cover nodes outside ``res`` too.
         verbose: whether to output a more verbose summary of the cluster state.
 
     NOTES: Some systems allow users to share GPUs.  The logic below amounts to a
@@ -781,7 +781,11 @@ def available(res: dict, excluded: dict, verbose: bool = False):
       until all GPUs on the server are assigned.  If more GPUs than this are listed as
       allocated by squeue, we assume any further GPU usage occurs by sharing GPUs.
     """
-    usage = gpu_usage(resources=res, excluded=excluded)
+    usage = {
+        user: {gpu_type: {node: n for node, n in nodes.items() if node in res}
+               for gpu_type, nodes in by_type.items()}
+        for user, by_type in usage.items()
+    }
     subtract_usage(res, usage)
     by_type = resource_by_type(res)
     total = sum(x["count"] for sublist in by_type.values() for x in sublist)
@@ -812,16 +816,23 @@ def all_info(color: int, verbose: bool, partition: Optional[str] = None):
     print(f"Under {slurm_str} management")
     print(divider)
     resources = parse_all_gpus(partition=partition)
-    accessible, _, excluded = split_by_access(
+    accessible, _, _ = split_by_access(
         resources, node_states(partition=partition), reserved_for_others()
     )
     summary_by_type(resources, tag="up")
     print(divider)
     summary_by_type(accessible, tag="accessible")
     print(divider)
-    in_use(resources, partition=partition)
+    # Jobs count on the nodes they run on, whichever partition they were sent to:
+    # one sent to the mixed gpu partition can hold the GPUs of a gpu-a40 node.
+    # With -p, GPUs held on the cluster's other nodes are expected, not lost.
+    outside = {}
+    if partition:
+        outside = {node: f"outside {partition}" for node in parse_all_gpus() if node not in resources}
+    usage = gpu_usage(resources, partition=None, excluded=outside)
+    in_use(usage)
     print(divider)
-    available(accessible, excluded, verbose=verbose)
+    available(accessible, usage, verbose=verbose)
     print(divider)
 
 def main():
