@@ -21,6 +21,8 @@ import functools
 import json
 import pwd
 import socket
+import sys
+import threading
 import bisect
 import copy
 import time
@@ -453,8 +455,13 @@ def _classify_pending_reason(reason):
 
 
 def get_partition_gpu_types():
-    """Map every partition to the set of GPU types its nodes provide."""
-    rows = parse_cmd("sinfo -a -o '%P|%G' --noheader")
+    """Map every monitored partition to the set of GPU types its nodes provide.
+
+    Only MONITORED_PARTITIONS: the GPU counts Queue Overview weighs demand
+    against come from them, so a job queued elsewhere (bii-gpu) is not demand
+    for those GPUs.
+    """
+    rows = parse_cmd(f"sinfo -h -p {MONITORED_PARTITIONS} -o '%P|%G'")
     partition_types = defaultdict(set)
     for row in rows:
         tokens = row.split("|")
@@ -469,7 +476,8 @@ def get_partition_gpu_types():
 
 
 def parse_queue_stats_to_table():
-    """Aggregate all pending GPU jobs by the GPU type they are actually waiting for.
+    """Aggregate the pending GPU jobs of the monitored partitions by the GPU type
+    they are actually waiting for.
 
     A pending job may list several partitions and may not name a GPU type at all, so
     the types it can land on are derived from the partitions it requested. Jobs left
@@ -495,8 +503,8 @@ def parse_queue_stats_to_table():
 
     for job in squeue_jobs("PENDING"):
         partition_list = [p.strip() for p in job["partition"].split(",")]
-        # A GPU partition is one whose nodes have GPUs, so every partition kept here
-        # contributes at least one candidate type below.
+        # The monitored partitions whose nodes have GPUs, so every partition kept
+        # here contributes at least one candidate type below.
         gpu_parts = [p for p in partition_list if p in partition_types]
         if not gpu_parts:
             not_gpu_partition += 1
@@ -539,8 +547,8 @@ def parse_queue_stats_to_table():
         group_stats[group_key]["types"][req_type if req_type else "any"] += total_gpus
 
     if not_gpu_partition or no_gpu_request:
-        print(f"Note: queue overview skipped {not_gpu_partition} pending jobs outside the GPU "
-              f"partitions and {no_gpu_request} that ask for no GPU")
+        print(f"Note: queue overview skipped {not_gpu_partition} pending jobs outside the "
+              f"monitored GPU partitions and {no_gpu_request} that ask for no GPU")
     for group, req_type in sorted(impossible_requests):
         print(
             f"Warning: pending jobs ask for gpu type {req_type!r} in partition(s) "
@@ -710,6 +718,7 @@ NO_ACCESS_MARKERS = (
 NOT_A_MEMBER_MARKER = "Invalid account"
 # Pools already reported as inaccessible, so the log is not repeated on every refresh.
 _reported_no_access = set()
+_reported_no_access_guard = threading.Lock()
 # Whether an account may use a pool is account, QOS and partition configuration,
 # which barely moves between refreshes, yet the panel asked slurmctld to simulate
 # the same fourteen jobs on every one.  One marker above does follow live state:
@@ -946,8 +955,10 @@ def _test_only_verdict(account, partition, gpu_type, gpus, cpus, mem_mb, minutes
         reason = lines[-1].replace("sbatch: error: ", "") if lines else "no output"
         pool = (partition, gpu_type)
         if any(marker in reason for marker in NO_ACCESS_MARKERS):
-            if pool not in _reported_no_access:
+            with _reported_no_access_guard:
+                first_report = pool not in _reported_no_access
                 _reported_no_access.add(pool)
+            if first_report:
                 print(
                     f"Note: {account} has no schedulable node for {gpu_type} in "
                     f"{partition} ({reason}); leaving that pool out of the estimates"
@@ -1462,7 +1473,10 @@ def parse_wait_estimate_to_table(job=None):
     # depend on one another, and this panel sets how long a page load takes, so
     # overlap them. The pool is kept small: the login node is short of memory
     # to fork with, and parse_cmd already shares one run of a repeated command.
+    # The priority factors go first: without the account's score there is nothing
+    # to estimate, and whatever has not started by then is dropped.
     with ThreadPoolExecutor(max_workers=WAIT_ESTIMATE_WORKERS) as pool:
+        factors = pool.submit(_partition_factors)
         verdicts = [pool.submit(_test_only_check, spec, job["account"]) for spec in specs]
         reads = {
             name: pool.submit(fetch)
@@ -1472,20 +1486,20 @@ def parse_wait_estimate_to_table(job=None):
                 ("shapes", _node_shapes),
                 ("limits", _partition_limits),
                 ("efficiency", _walltime_efficiency),
-                ("factors", _partition_factors),
                 ("priorities", _sprio_by_job),
                 ("running", lambda: squeue_jobs("RUNNING")),
                 ("pending", lambda: squeue_jobs("PENDING", MONITORED_PARTITIONS)),
             )
         }
-        scores = _account_score(job["account"], reads["factors"].result())
+        scores = _account_score(job["account"], factors.result())
+        if scores is None:
+            pool.shutdown(cancel_futures=True)
+            return (
+                f"<p>Could not work out the priority a job from <b>{job['account']}</b> "
+                "would get, so there is nothing to estimate against.</p>"
+            )
         read = {name: future.result() for name, future in reads.items()}
         verdicts = [future.result() for future in verdicts]
-    if scores is None:
-        return (
-            f"<p>Could not work out the priority a job from <b>{job['account']}</b> "
-            "would get, so there is nothing to estimate against.</p>"
-        )
     pools = read["pools"]
     states = pools["states"]
     total_by_node = pools["total_by_node"]
@@ -2823,6 +2837,10 @@ def main():
         "--port", default=2070, type=int, help="the port for the website"
     )
     args = parser.parse_args()
+    # Deployed with stdout sent to app.log, where Python holds prints back until
+    # 8 KB pile up, and every restart or job end kills the process before then:
+    # the log had not one of the app's warnings or notes. Write each line out.
+    sys.stdout.reconfigure(line_buffering=True)
 
     app = Flask(__name__)
 
@@ -2836,6 +2854,7 @@ def main():
             hostname=f"{socket.gethostname()}:{args.port}",
             accounts=LAB_ACCOUNTS,
             my_jobs_min_gap_ms=CPU_SAMPLE_MIN_GAP * 1000,
+            standard_hours=STANDARD_JOB_HOURS,
         )
 
     @app.route("/time_feed")

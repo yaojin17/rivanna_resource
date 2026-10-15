@@ -65,6 +65,8 @@ Per GPU type: GPUs free, jobs waiting, GPUs they want, and queue depth.
 
 ![Queue Overview](../screenshots/queue_overview.png)
 
+- Only jobs queued for the monitored GPU partitions count; a job also listing other
+  partitions is counted for its monitored ones.
 - A job that fits several GPU types is counted under each, so `Flexible` overlaps.
 - Jobs blocked by a dependency or a QOS/array limit are shown as `Not Competing`.
 

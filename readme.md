@@ -74,7 +74,10 @@ python available_resources.py    # only what is free
   and the app no longer needs django or humanize. The panels share one `squeue` read
   per job state, and Queue Overview now counts every task of a pending array with a
   long task list, which the old read cut short. `slurm_gpustat.py` drops its unused
-  usage-logging daemon (`--action`).
+  usage-logging daemon (`--action`). Queue Overview counts only jobs queued for the
+  monitored partitions, `RIVANNA_STANDARD_HOURS` now sets the walltime the form starts
+  with, and the app's warnings reach `app.log` as they happen instead of being lost
+  on restart.
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts
