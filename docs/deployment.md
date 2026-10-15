@@ -110,7 +110,7 @@ Environment variables, read when `app.py` starts.
 | `RIVANNA_WALLTIME_DAYS` | `3` | Days of finished jobs used for the `Typical` wait. |
 | `RIVANNA_WALLTIME_TTL` | `1800` | Seconds before that sample is refreshed. |
 | `RIVANNA_TEST_ONLY_TTL` | `60` | Seconds an `sbatch --test-only` verdict is kept. |
-| `RIVANNA_CMD_CACHE_SECONDS` | `10` | Seconds identical SLURM queries are shared between panels. `0` turns it off. |
+| `RIVANNA_CMD_CACHE_SECONDS` | `10` | Seconds identical SLURM queries, and `hdquota`, are shared between panels. `0` turns it off. |
 
 `--host` and `--port` set where it listens (default `0.0.0.0:2070`). Header, footer and
 styling live in [index.html](../index.html).

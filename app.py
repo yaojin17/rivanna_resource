@@ -46,6 +46,11 @@ from slurm_gpustat import (
     gpu_usage,
     node_states,
     is_inaccessible,
+    split_by_access,
+    partition_nodes,
+    DOWN_STATE_KEYWORDS,
+    RESV_STATE_KEYWORDS,
+    NONAME_GPU,
     parse_cmd,
     avail_stats_for_node,
     parse_node_names,
@@ -60,35 +65,38 @@ from slurm_gpustat import (
     subtract_usage,
     format_size,
     ttl_cache,
+    CMD_CACHE_SECONDS,
     MONITORED_PARTITIONS,
     LAB_ACCOUNTS,
 )
 
-# from https://developer.nvidia.com/cuda-gpus
-# sort gpu by computing power
-# if fail to display other GPU types, add items in the following dictionaries.
-CAPABILITY = {
-    "1g.10gb": 8.0,
-    "1g.24gb": 8.0,
-    "b200": 10.0,
-    "rtx_pro_6000": 12.0,
-    "h200": 8.9,
-    "a4500": 8.0,
-    "a100": 8.0,
-    "a6000": 8.6,
-    "a40": 8.6,
-    "a30": 8.0,
-    "a10": 8.6,
-    "a16": 8.6,
-    "rtx_3090": 8.6,
-    "rtx_2080": 7.5,
-    "v100": 7.0,
-    "gv100gl": 7.0,
-    "v100s": 7.0,
-    "p40": 6.1,
-    "m40": 5.2,
-    "rtx6k": 7.5,
-    "rtx8k": 7.5,
+# Every GPU type the page knows: its compute capability
+# (https://developer.nvidia.com/cuda-gpus), which orders types most capable first,
+# and the memory label shown next to it. A type missing here sorts first and goes
+# unlabelled, so add a row when a new one shows up.
+GPU_TYPES = {
+    "1g.10gb": (8.0, "[10g]"),
+    "1g.24gb": (8.0, "[24g]"),
+    "b200": (10.0, "[192g]"),
+    "rtx_pro_6000": (12.0, "[96g]"),
+    "h200": (8.9, "[141g]"),
+    "a4500": (8.0, "[20g]"),
+    "a100": (8.0, "[40/80g]"),
+    "a6000": (8.6, "[48g]"),
+    "a40": (8.6, "[48g]"),
+    "a30": (8.0, "[24g]"),
+    "a10": (8.6, ""),
+    "a16": (8.6, ""),
+    "rtx_3090": (8.6, "[24g]"),
+    "rtx_2080": (7.5, "[11g]"),
+    "v100": (7.0, "[16g]"),
+    "gv100gl": (7.0, "[32g]"),
+    "v100s": (7.0, "[32g]"),
+    "p40": (6.1, "[24g]"),
+    "m40": (5.2, "[12/24g]"),
+    "rtx6k": (7.5, "[24g]"),
+    "rtx8k": (7.5, "[48g]"),
+    "mig": (None, "[11g]"),
 }
 
 
@@ -100,38 +108,27 @@ def _type_rank(gpu_type):
     string hashing and so is randomised per process. Without the name the tied
     types came out in a different order every time the app was restarted.
     """
-    return (-CAPABILITY.get(gpu_type, 10.0), gpu_type)
+    capability = GPU_TYPES.get(gpu_type, (None, ""))[0]
+    return (-(10.0 if capability is None else capability), gpu_type)
 
-GMEM = {
-    "mig": "[11g]",
-    "1g.10gb": "[10g]",
-    "1g.24gb": "[24g]",
-    "b200": "[192g]",
-    "rtx_pro_6000": "[96g]",
-    "h200": "[141g]",
-    "a4500": "[20g]",
-    "a100": "[40/80g]",
-    "a6000": "[48g]",
-    "a40": "[48g]",
-    "a30": "[24g]",
-    "rtx_3090": "[24g]",
-    "rtx_2080": "[11g]",
-    "v100": "[16g]",
-    "gv100gl": "[32g]",
-    "v100s": "[32g]",
-    "p40": "[24g]",
-    "m40": "[12/24g]",
-    "rtx6k": "[24g]",
-    "rtx8k": "[48g]",
-}
+
+def _mem_label(gpu_type):
+    """The memory label shown next to a GPU type, e.g. "[48g]"; "" if unknown."""
+    return GPU_TYPES.get(gpu_type, (None, ""))[1]
+
+
 OLD_GPU_TYPES = ["p40", "m40"]
 # Memory sizes the leaderboard also totals on their own, as "48g=N".
 LEADERBOARD_GMEM = (48,)
 
 
-def get_resource_bar(avail, total, text="", long=False):
-    """Create a long/short progress bar with text overlaid. Formatting handled in css."""
+def get_resource_bar(avail, total, text=None, long=False):
+    """Create a long/short progress bar with text overlaid. Formatting handled in css.
 
+    The text defaults to "avail / total".
+    """
+    if text is None:
+        text = f"{avail} / {total}"
     if long:
         long_str = " class=long"
     else:
@@ -175,7 +172,7 @@ def _leaderboard_row(user, subdict, name_width, owner):
         val for key, val in subdict["n_gpu"].items() if key not in OLD_GPU_TYPES
     ]
     for gm in LEADERBOARD_GMEM:
-        total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
+        total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if _mem_label(key) == f'[{gm}g]'])):2s}"
     total += f"|newer={str(sum(num_new_gpus)):2s}"
     total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
     line = escape(f"{display_name(user):{name_width}s}[{total}]    {summary_str}")
@@ -196,9 +193,9 @@ def parse_leaderboard():
 def _state_badge(state):
     """Return an HTML badge for the node state."""
     s = state.lower()
-    if any(kw in s for kw in ("down", "drain", "drng", "inval")):
+    if any(kw in s for kw in DOWN_STATE_KEYWORDS):
         cls = "state-down"
-    elif any(kw in s for kw in ("resv", "plnd", "plan", "reboot", "pow_up")):
+    elif any(kw in s for kw in RESV_STATE_KEYWORDS + ("plan",)):
         cls = "state-resv"
     elif "mix" in s or "alloc" in s:
         cls = "state-busy"
@@ -228,6 +225,14 @@ def _is_mig_type(gpu_type):
     return gpu_type[0].isdigit() if gpu_type else False
 
 
+def _split_mig(items, type_of=lambda item: item):
+    """``items`` as (full GPUs, MIG slices), each keeping its order."""
+    return (
+        [item for item in items if not _is_mig_type(type_of(item))],
+        [item for item in items if _is_mig_type(type_of(item))],
+    )
+
+
 def _gpu_pools():
     """Query SLURM once for the current GPU inventory of the monitored partitions.
 
@@ -243,29 +248,11 @@ def _gpu_pools():
         node: name for node, name in reserved_for_others().items() if node in resources
     }
     # Reserved for somebody else is as good as down for us, whatever sinfo says.
+    res_accessible, res_down, excluded = split_by_access(resources, states, reserved)
     for node in reserved:
         states[node] = "resv"
 
-    # Separate accessible vs inaccessible nodes
-    res_accessible = {
-        key: val
-        for key, val in resources.items()
-        if not is_inaccessible(states.get(key, "down"))
-    }
-    res_down = {
-        key: val
-        for key, val in resources.items()
-        if is_inaccessible(states.get(key, "down"))
-    }
-
     res_total = copy.deepcopy(res_accessible)
-    # Why each left-out node is not ours to count, for gpu_usage's note on the GPUs
-    # still held there. A reserved node's state was overwritten above.
-    excluded = {
-        node: f"reserved for {reserved[node]}" if node in reserved
-        else f"in state {states.get(node, 'missing from sinfo')}"
-        for node in res_down
-    }
     usage = gpu_usage(resources=res_accessible, excluded=excluded)
     subtract_usage(res_accessible, usage)
 
@@ -296,9 +283,7 @@ def parse_usage_to_table():
 
     all_gpu_types = set(res_total_by_type.keys()) | set(res_down_by_type.keys())
 
-    type_list = sorted(all_gpu_types, key=_type_rank)
-    gpu_type_list = [t for t in type_list if not _is_mig_type(t)]
-    mig_type_list = [t for t in type_list if _is_mig_type(t)]
+    gpu_type_list, mig_type_list = _split_mig(sorted(all_gpu_types, key=_type_rank))
 
     def _down_note(entries):
         """"(8 offline, 8 reserved)" for down-bucket entries, split by cause."""
@@ -326,11 +311,7 @@ def parse_usage_to_table():
                 node_state = states.get(node, "unknown")
                 state_html = f"<td>{_state_badge(node_state)}</td>"
                 node_name_td = f"<td>{node}</td>"
-                gpu_bar = get_resource_bar(
-                    gpu_count_avail.get(node, 0),
-                    gpu_count_total[node],
-                    text=f"{gpu_count_avail.get(node, 0)} / {gpu_count_total[node]}",
-                )
+                gpu_bar = get_resource_bar(gpu_count_avail.get(node, 0), gpu_count_total[node])
                 gpu_stat = f"<td>gpu: {gpu_bar}</td>"
 
                 users_list = [user for user in usage if node in usage[user].get(gpu_type, [])]
@@ -341,7 +322,7 @@ def parse_usage_to_table():
 
                 stats = avail_stats_for_node(node)
                 cpu_free, cpu_total = stats["cpu"]
-                cpu_bar = get_resource_bar(cpu_free, cpu_total, text=f"{cpu_free} / {cpu_total}")
+                cpu_bar = get_resource_bar(cpu_free, cpu_total)
                 mem_free, mem_total = stats["mem"]
                 mem_bar = get_resource_bar(
                     mem_free // 1024**3, mem_total // 1024**3,
@@ -370,12 +351,12 @@ def parse_usage_to_table():
 
             type_total = sum(gpu_count_total.values())
             type_avail = sum(gpu_count_avail.values())
-            type_bar = get_resource_bar(type_avail, type_total, text=f"{type_avail} / {type_total}")
+            type_bar = get_resource_bar(type_avail, type_total)
 
             down_note = _down_note(down_node_dicts)
 
             rows_html.append(
-                f'<tr><td colspan="7"><b>{gpu_type} {GMEM.get(gpu_type, "")}: {type_bar} gpus available{down_note}</b></td></tr>'
+                f'<tr><td colspan="7"><b>{gpu_type} {_mem_label(gpu_type)}: {type_bar} gpus available{down_note}</b></td></tr>'
             )
             rows_html.extend(node_summaries)
             rows_html.extend(down_summaries)
@@ -388,14 +369,14 @@ def parse_usage_to_table():
     gpu_rows, gpu_avail, gpu_total, gpu_down = _render_type_rows(gpu_type_list)
     mig_rows, mig_avail, mig_total, mig_down = _render_type_rows(mig_type_list)
 
-    total_bar = get_resource_bar(gpu_avail, gpu_total, text=f"{gpu_avail} / {gpu_total}")
+    total_bar = get_resource_bar(gpu_avail, gpu_total)
     down_note = _down_note(gpu_down)
     total_summary = f'<tr><td colspan="7"><h3>Summary: {total_bar} gpus available{down_note}</h3></td></tr>'
 
     table_html = f"<table>{total_summary}{gpu_rows}</table>"
 
     if mig_type_list:
-        mig_bar = get_resource_bar(mig_avail, mig_total, text=f"{mig_avail} / {mig_total}")
+        mig_bar = get_resource_bar(mig_avail, mig_total)
         mig_down_note = _down_note(mig_down)
         table_html += (
             f'<details class="mig-details"><summary>MIG: {mig_bar} slices available{mig_down_note}</summary>'
@@ -478,7 +459,7 @@ def get_partition_gpu_types():
         # sinfo marks the default partition with a trailing '*'
         partition = tokens[0].strip().rstrip("*")
         for gpu_type, _ in parse_gres_gpus(tokens[1]):
-            partition_types[partition].add(gpu_type or "NONAME_GPU")
+            partition_types[partition].add(gpu_type or NONAME_GPU)
     return partition_types
 
 
@@ -526,7 +507,7 @@ def parse_queue_stats_to_table():
         num_nodes = int(job["numnodes"]) if job["numnodes"].isdigit() else 1
         # A pending array's tasks share one row, e.g. tasks 0-5,8%2
         tasks = job["arraytaskid"]
-        num_tasks = _expand_array_tasks(tasks)[0] if tasks not in ("", "N/A") else 1
+        num_tasks = _array_task_count(tasks)
         total_gpus = int(match.group(2)) * num_nodes * num_tasks
 
         candidates = set().union(*(partition_types[p] for p in gpu_parts))
@@ -570,9 +551,7 @@ def parse_queue_stats_to_table():
     free_by_type = pools["free_by_type"]
 
     all_types = set(committed) | set(flexible) | set(total_by_type)
-    type_list = sorted(all_types, key=_type_rank)
-    gpu_type_list = [t for t in type_list if not _is_mig_type(t)]
-    mig_type_list = [t for t in type_list if _is_mig_type(t)]
+    gpu_type_list, mig_type_list = _split_mig(sorted(all_types, key=_type_rank))
 
     def _pressure_cell(wanted, capacity):
         """Report queued GPUs as a multiple of the partition's whole capacity."""
@@ -623,8 +602,8 @@ def parse_queue_stats_to_table():
                 idle_cell = '<span class="queue-muted">&ndash;</span>'
 
             html += (
-                f"<tr><td><b>{gpu_type}</b> {GMEM.get(gpu_type, '')}</td>"
-                f"<td>{get_resource_bar(free, capacity, text=f'{free} / {capacity}')}</td>"
+                f"<tr><td><b>{gpu_type}</b> {_mem_label(gpu_type)}</td>"
+                f"<td>{get_resource_bar(free, capacity)}</td>"
                 f"<td>{waiting_jobs}</td><td><b>{waiting_gpus}</b></td>"
                 f"<td>{_pressure_cell(waiting_gpus, capacity)}</td>"
                 f"<td>{flex_cell}</td><td>{idle_cell}</td></tr>"
@@ -818,19 +797,6 @@ def _partition_limits():
     return limits
 
 
-def _partition_nodes():
-    """Map every monitored GPU partition to the set of nodes it contains."""
-    rows = parse_cmd(f"sinfo -h -p {MONITORED_PARTITIONS} -o '%P|%N'")
-    nodes = defaultdict(set)
-    for row in rows:
-        tokens = row.split("|")
-        if len(tokens) < 2:
-            print(f"Warning: unexpected sinfo node row {row!r}, skipping")
-            continue
-        nodes[tokens[0].strip().rstrip("*")] |= set(parse_node_names(tokens[1].strip()))
-    return nodes
-
-
 def _standard_job_specs(job):
     """Build the standard job for every monitored (partition, GPU type) pool.
 
@@ -859,7 +825,7 @@ def _standard_job_specs(job):
             print(f"Warning: unparsable cpu/mem {cpu_str!r}/{mem_str!r} in {partition}, skipping")
             continue
         for gpu_type, n_gpu in parse_gres_gpus(tokens[3]):
-            gpu_type = gpu_type or "NONAME_GPU"
+            gpu_type = gpu_type or NONAME_GPU
             if n_gpu is None:
                 print(f"Warning: partition {partition} gives no {gpu_type} gpu count, skipping")
                 continue
@@ -1023,6 +989,11 @@ def _expand_array_tasks(task_spec):
         print(f"Warning: unparsable array task spec {piece!r}, counting it as one task")
         count += 1
     return count, throttle
+
+
+def _array_task_count(tasks):
+    """Tasks behind one pending squeue row: its arraytaskid's count, 1 for a plain job."""
+    return 1 if tasks in ("", "N/A") else _expand_array_tasks(tasks)[0]
 
 
 def _sprio_rows():
@@ -1346,13 +1317,13 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
     return None
 
 
-def _account_score(account, partition_factors):
-    """Priority of a job submitted right now by ``account``, per partition."""
-    profile, max_qos = _account_priority_profile((account,))
-    if account not in profile or not max_qos:
+def _account_score(profile, partition_factors):
+    """Priority of a job submitted right now, per partition, for an account's
+    :func:`_account_priority_profile`; None when that could not be read."""
+    entry, max_qos = profile
+    if entry is None or not max_qos:
         return None
     weights = _priority_weights()
-    entry = profile[account]
     base = entry["qos_priority"] / max_qos * weights["PriorityWeightQOS"]
     base += entry["fairshare"] * weights["PriorityWeightFairShare"]
     return {p: int(base + factor) for p, factor in partition_factors.items()}
@@ -1463,15 +1434,13 @@ def _format_delta(seconds):
     return f"{days}d {hours}h"
 
 
-def parse_wait_estimate_to_table(job=None):
+def parse_wait_estimate_to_table(job):
     """Estimate how long the requested job would wait in each GPU pool.
 
     One SLURM snapshot (running jobs, ranked pending jobs, node shapes) feeds a
     per-pool scheduler replay, see :func:`_plan_pool`. sbatch --test-only is
     still run once per pool, but only to learn whether the account may use it.
     """
-    if job is None:
-        job = parse_standard_job_args({})
     specs = _standard_job_specs(job)
     if not specs:
         return "<p>No GPU partitions found.</p>"
@@ -1480,25 +1449,30 @@ def parse_wait_estimate_to_table(job=None):
     # depend on one another, and this panel sets how long a page load takes, so
     # overlap them. The pool is kept small: the login node is short of memory
     # to fork with, and parse_cmd already shares one run of a repeated command.
-    # The priority factors go first: without the account's score there is nothing
-    # to estimate, and whatever has not started by then is dropped.
+    # Work starts in the order it is submitted. The priority factors go first:
+    # without the account's score there is nothing to estimate, and whatever has
+    # not started by then is dropped. The two reads no other panel shares come
+    # next, sacct being the slowest command here when its cache is cold, and
+    # only then the test-only checks and the reads the other panels share.
     with ThreadPoolExecutor(max_workers=WAIT_ESTIMATE_WORKERS) as pool:
         factors = pool.submit(_partition_factors)
-        verdicts = [pool.submit(_test_only_check, spec, job["account"]) for spec in specs]
         reads = {
+            "efficiency": pool.submit(_walltime_efficiency),
+            "shapes": pool.submit(_node_shapes),
+        }
+        verdicts = [pool.submit(_test_only_check, spec, job["account"]) for spec in specs]
+        reads |= {
             name: pool.submit(fetch)
             for name, fetch in (
                 ("pools", _gpu_pools),
-                ("partition_nodes", _partition_nodes),
-                ("shapes", _node_shapes),
+                ("partition_nodes", partition_nodes),
                 ("limits", _partition_limits),
-                ("efficiency", _walltime_efficiency),
                 ("priorities", _sprio_by_job),
                 ("running", lambda: squeue_jobs("RUNNING")),
                 ("pending", lambda: squeue_jobs("PENDING", MONITORED_PARTITIONS)),
             )
         }
-        scores = _account_score(job["account"], factors.result())
+        scores = _account_score(_account_priority_profile(job["account"]), factors.result())
         if scores is None:
             pool.shutdown(cancel_futures=True)
             return (
@@ -1511,7 +1485,7 @@ def parse_wait_estimate_to_table(job=None):
     states = pools["states"]
     total_by_node = pools["total_by_node"]
     free_by_node = pools["free_by_node"]
-    partition_nodes = read["partition_nodes"]
+    part_nodes = read["partition_nodes"]
     shapes = read["shapes"]
     limits = read["limits"]
     efficiency = read["efficiency"]
@@ -1526,7 +1500,7 @@ def parse_wait_estimate_to_table(job=None):
     def _count(by_node, partition, gpu_type):
         return sum(
             entry["count"]
-            for node in partition_nodes.get(partition, ())
+            for node in part_nodes.get(partition, ())
             for entry in by_node.get(node, ())
             if entry["type"] == gpu_type
         )
@@ -1545,7 +1519,7 @@ def parse_wait_estimate_to_table(job=None):
 
         # The pool: reachable nodes of this partition carrying this GPU type.
         nodes = {}
-        for node in partition_nodes.get(partition, ()):
+        for node in part_nodes.get(partition, ()):
             if is_inaccessible(states.get(node, "down")):
                 continue
             gpus = sum(e["count"] for e in total_by_node.get(node, ()) if e["type"] == gpu_type)
@@ -1572,7 +1546,7 @@ def parse_wait_estimate_to_table(job=None):
 
         # Everyone ranked above a fresh job of ours in any partition sharing
         # these nodes: those are the jobs SLURM will place before it.
-        sharing = [p for p, members in partition_nodes.items() if members & nodes.keys()]
+        sharing = [p for p, members in part_nodes.items() if members & nodes.keys()]
         score = scores.get(partition)
         if score is None:
             print(f"Warning: no partition factor for {partition}, ranking against 0")
@@ -1637,7 +1611,6 @@ def parse_wait_estimate_to_table(job=None):
                 shape += (
                     f'<span class="queue-flex" title="{"; ".join(spec["capped"])}">&nbsp;*</span>'
                 )
-            free_text = f"{row['free']} / {row['capacity']}"
             worst_cell = _wait_cell(
                 row["worst"],
                 "Every job ahead of you and every running job uses its full time limit",
@@ -1660,10 +1633,10 @@ def parse_wait_estimate_to_table(job=None):
                 start = row["worst"]
             start_cell = start.strftime("%m-%d %H:%M") if start else '<span class="queue-muted">&ndash;</span>'
             html += (
-                f"<tr><td><b>{gpu_type}</b> {GMEM.get(gpu_type, '')}</td>"
+                f"<tr><td><b>{gpu_type}</b> {_mem_label(gpu_type)}</td>"
                 f"<td>{partition}</td>"
                 f"<td class='queue-muted'>{shape}</td>"
-                f"<td>{get_resource_bar(row['free'], row['capacity'], text=free_text)}</td>"
+                f"<td>{get_resource_bar(row['free'], row['capacity'])}</td>"
                 f'<td title="Ranked pending jobs whose priority beats {row["score"]:,}, the '
                 f'score a fresh job of yours gets in {partition}">'
                 f"{row['ahead_jobs']} jobs / <b>{row['ahead_gpus']}</b> gpus</td>"
@@ -1688,8 +1661,7 @@ def parse_wait_estimate_to_table(job=None):
         'unavailable)">Start</th></tr>'
     )
 
-    mig_rows = [r for r in rows if _is_mig_type(r["spec"]["gpu_type"])]
-    gpu_rows = [r for r in rows if not _is_mig_type(r["spec"]["gpu_type"])]
+    gpu_rows, mig_rows = _split_mig(rows, lambda row: row["spec"]["gpu_type"])
 
     table_html = (
         f"<table>{header}{_render_rows(gpu_rows)}</table>"
@@ -1788,63 +1760,62 @@ def _qos_priorities():
     return priorities
 
 
-def _account_priority_profile(accounts):
-    """Fairshare factor and highest-priority QOS available to each of ``accounts``."""
-    account_list = ",".join(accounts)
-    shares = defaultdict(list)
-    for row in parse_cmd(f"sshare -a -n -P -A {account_list} -o Account,User,FairShare"):
+def _account_priority_profile(account):
+    """Fairshare factor and highest-priority QOS available to ``account``.
+
+    Returns ``(entry, max_qos)``. ``entry`` holds the median FairShare of the
+    account's users and its best QOS with that QOS's priority, or is None (with a
+    warning) when SLURM gives no FairShare or no usable QOS; ``max_qos`` is the
+    highest QOS priority configured on the cluster.
+    """
+    shares = []
+    for row in parse_cmd(f"sshare -a -n -P -A {account} -o Account,User,FairShare"):
         fields = row.split("|")
         if len(fields) < 3:
             print(f"Warning: unexpected sshare row {row!r}, skipping")
             continue
-        account, user, share = (f.strip() for f in fields[:3])
+        row_account, user, share = (f.strip() for f in fields[:3])
         # The account-level row carries no FairShare of its own; only users do.
         if not user:
             continue
         if not share:
-            print(f"Warning: no FairShare for {account}/{user}, skipping")
+            print(f"Warning: no FairShare for {row_account}/{user}, skipping")
             continue
         try:
-            shares[account].append(float(share))
+            value = float(share)
         except ValueError:
-            print(f"Warning: unparsable FairShare {share!r} for {account}/{user}, skipping")
+            print(f"Warning: unparsable FairShare {share!r} for {row_account}/{user}, skipping")
+            continue
+        if row_account == account:
+            shares.append(value)
 
     qos_priorities = _qos_priorities()
-    account_qos = {}
-    for row in parse_cmd(f"sacctmgr -n -P show assoc account={account_list} format=Account,QOS"):
+    best = None
+    for row in parse_cmd(f"sacctmgr -n -P show assoc account={account} format=Account,QOS"):
         fields = row.split("|")
         if len(fields) < 2:
             print(f"Warning: unexpected sacctmgr assoc row {row!r}, skipping")
             continue
-        account = fields[0].strip()
+        row_account = fields[0].strip()
         for name in (q.strip() for q in fields[1].split(",") if q.strip()):
             if name not in qos_priorities:
-                print(f"Warning: QOS {name!r} of {account} has no configured priority, skipping")
+                print(f"Warning: QOS {name!r} of {row_account} has no configured priority, skipping")
                 continue
             # A job may pick any QOS it is entitled to, so the best one is the
             # one worth reporting.
-            best = account_qos.get(account)
-            if best is None or qos_priorities[name] > qos_priorities[best]:
-                account_qos[account] = name
+            if row_account == account and (best is None or qos_priorities[name] > qos_priorities[best]):
+                best = name
 
     max_qos = max(qos_priorities.values()) if qos_priorities else 0
-    profile = {}
-    for account in accounts:
-        if account not in shares:
-            print(f"Warning: no user of {account} has a FairShare value, skipping the account")
-            continue
-        if account not in account_qos:
-            print(f"Warning: no usable QOS found for {account}, skipping the account")
-            continue
-        values = sorted(shares[account])
-        profile[account] = {
-            "fairshare": values[len(values) // 2],
-            "fairshare_range": (values[0], values[-1]),
-            "users": len(values),
-            "qos": account_qos[account],
-            "qos_priority": qos_priorities[account_qos[account]],
-        }
-    return profile, max_qos
+    if not shares:
+        print(f"Warning: no user of {account} has a FairShare value, skipping the account")
+        return None, max_qos
+    if best is None:
+        print(f"Warning: no usable QOS found for {account}, skipping the account")
+        return None, max_qos
+    shares.sort()
+    entry = {"fairshare": shares[len(shares) // 2], "qos": best, "qos_priority": qos_priorities[best]}
+    return entry, max_qos
 
 
 def _partition_priority_data():
@@ -1873,26 +1844,26 @@ def _partition_priority_data():
     return totals, factors
 
 
-def parse_priority_to_table(account=None):
+def parse_priority_to_table(account):
     """Rank a freshly submitted job from ``account`` inside every GPU pool."""
-    account = account or LAB_ACCOUNTS[0]
-    profile, max_qos = _account_priority_profile((account,))
-    if account not in profile or not max_qos:
+    profile = _account_priority_profile(account)
+    entry, max_qos = profile
+    if entry is None or not max_qos:
         return f"<p>Could not read the priority settings of <b>{account}</b> from SLURM.</p>"
     totals, factors = _partition_priority_data()
 
-    partitions = [p for p in _partition_nodes() if p in totals]
+    partitions = [p for p in partition_nodes() if p in totals]
     partitions.sort(key=lambda p: factors.get(p, 0), reverse=True)
     if not partitions:
         return "<p>No GPU partition currently has jobs competing for priority.</p>"
     # A job submitted right now has no age factor yet.
-    scores = _account_score(account, {p: factors.get(p, 0) for p in partitions})
+    scores = _account_score(profile, {p: factors.get(p, 0) for p in partitions})
 
     header = (
         '<tr><th>Partition</th><th title="Pending jobs SLURM is currently ranking in '
         'this partition; jobs blocked by a dependency get no priority and are not '
         f'counted">Competing</th><th>{account}<br><span class="queue-muted">'
-        f'{profile[account]["qos"]} / fs {profile[account]["fairshare"]:.3f}</span></th></tr>'
+        f'{entry["qos"]} / fs {entry["fairshare"]:.3f}</span></th></tr>'
     )
 
     body = ""
@@ -1948,7 +1919,7 @@ def _short_limit(text):
     return f"{days}d{hours}h" if hours else f"{days}d"
 
 
-def parse_queue_to_table(account=None):
+def parse_queue_to_table(account):
     """Pending jobs of ``account``, laid out like squeue's own columns.
 
     START_TIME is SLURM's own estimate (what ``squeue --start`` reports), filled
@@ -1962,10 +1933,9 @@ def parse_queue_to_table(account=None):
     The last line totals the account's pending jobs and the GPUs they ask for,
     counting each task of such a row.
     """
-    account = account or LAB_ACCOUNTS[0]
     columns = ("jobid", "arraytaskid", "partition", "username", "timelimit",
                "tres-alloc", "submittime", "starttime", "reason")
-    jobs = [job for job in squeue_jobs("PENDING") if job["account"] == account]
+    jobs = squeue_jobs("PENDING", account=account)
     if not jobs:
         return f"no pending job in {account}"
 
@@ -1974,11 +1944,9 @@ def parse_queue_to_table(account=None):
     for jobid, tasks, partition, user, limit, tres, submit, start, reason in (
         [job[c] for c in columns] for job in jobs
     ):
-        count = 1
-        if tasks not in ("", "N/A"):
-            count, _ = _expand_array_tasks(tasks)
-            if count > 1:
-                jobid = f"{jobid}_[{tasks}]"
+        count = _array_task_count(tasks)
+        if count > 1:
+            jobid = f"{jobid}_[{tasks}]"
         gpus = alloc_gpu_count(tres)
         total_jobs += count
         total_gpus += count * gpus
@@ -2023,7 +1991,7 @@ def _gpu_type_on_nodes(jobid, node_str, inventory):
     return "/".join(sorted(types, key=_type_rank))
 
 
-def parse_running_to_table(account=None):
+def parse_running_to_table(account):
     """Running jobs of ``account``, the counterpart of the waiting queue.
 
     TIME is how long the job has run and START_TIME when it started, both as
@@ -2031,10 +1999,9 @@ def parse_running_to_table(account=None):
     TRES, and GPU_TYPE the type of the nodes it runs on (see
     :func:`_gpu_type_on_nodes`). The last line totals the account's jobs and GPUs.
     """
-    account = account or LAB_ACCOUNTS[0]
     columns = ("jobid", "partition", "username", "timeused", "timelimit",
                "tres-alloc", "starttime", "nodelist")
-    jobs = [job for job in squeue_jobs("RUNNING") if job["account"] == account]
+    jobs = squeue_jobs("RUNNING", account=account)
     if not jobs:
         return f"no running job in {account}"
 
@@ -2064,16 +2031,27 @@ def parse_running_to_table(account=None):
     return "\n".join(out)
 
 
+def _table_row(cells, tag="td"):
+    """One HTML table row with a ``tag`` cell per entry of ``cells``."""
+    return "<tr>" + "".join(f"<{tag}>{cell}</{tag}>" for cell in cells) + "</tr>"
+
+
+@ttl_cache(CMD_CACHE_SECONDS)
+def _hdquota():
+    """hdquota's output, reused for CMD_CACHE_SECONDS like a SLURM query's."""
+    return check_output("hdquota", shell=True).decode("utf-8")
+
+
 def parse_disk_quota():
     """Run 'hdquota' command and parse the output to an HTML table."""
     try:
-        output = check_output("hdquota", shell=True).decode("utf-8")
+        output = _hdquota()
     except (CalledProcessError, OSError) as exc:
         print(f"Warning: hdquota failed: {exc}")
         return f"<p>Error getting disk quota information: {exc}</p>"
 
     headers = ["Storage Type", "Location", "Size", "Used", "Avail", "Use%"]
-    table_html = "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
+    table_html = "<table>" + _table_row(headers, "th")
     for line in output.split("\n")[2:]:  # Skip header and separator lines
         parts = line.split()
         if not parts:
@@ -2085,19 +2063,17 @@ def parse_disk_quota():
             print(f"Warning: unexpected hdquota line {line!r}, skipping")
             continue
         size, used, avail = (f"{parts[i]} {parts[i + 1]}" for i in (2, 4, 6))
-        cells = (parts[0], parts[1], size, used, avail, parts[8])
-        table_html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
+        table_html += _table_row((parts[0], parts[1], size, used, avail, parts[8]))
     return table_html + "</table>"
 
 
-def parse_allocations_to_table(account=None):
+def parse_allocations_to_table(account):
     """Run 'allocations -a <account>' and parse the output to an HTML table.
 
     The command only prints the balance table to members of the account; for
     everyone else it lists the members and nothing else, which is why an empty
     table is reported as "not a member" rather than "no allocation".
     """
-    account = account or LAB_ACCOUNTS[0]
     cmd = f"allocations -a {account}"
     output = parse_cmd(cmd)
     if not output:
@@ -2130,50 +2106,18 @@ def parse_allocations_to_table(account=None):
     if not allocation_lines:
         return f"<p>No allocation data found for {account}.</p>"
 
-    columns = [
-        "Description",
-        "StartTime",
-        "EndTime",
-        "Allocated",
-        "Remaining",
-        "PercentUsed",
-        "Active",
-    ]
-
-    # Create HTML table
-    table_html = "<table><tr>"
-    for col in columns:
-        table_html += f"<th>{col}</th>"
-    table_html += "</tr>"
-
-    # Parse each data row by splitting on whitespace. StartTime is a date and a
-    # time, so a complete row has eight fields for the seven columns.
+    columns = ["Description", "StartTime", "EndTime", "Allocated", "Remaining",
+               "PercentUsed", "Active"]
+    table_html = "<table>" + _table_row(columns, "th")
+    # Split on whitespace. StartTime is a date and a time, so a complete row has
+    # eight fields for the seven columns.
     for row in allocation_lines:
         parts = row.split()
         if len(parts) < 8:
             print(f"Warning: incomplete allocation row {row!r} for {account}, skipping")
             continue
-
-        table_html += "<tr>"
-        # Description
-        table_html += f"<td>{parts[0]}</td>"
-        # StartTime (date and time)
-        table_html += f"<td>{parts[1]} {parts[2]}</td>"
-        # EndTime
-        table_html += f"<td>{parts[3]}</td>"
-        # Allocated
-        table_html += f"<td>{parts[4]}</td>"
-        # Remaining
-        table_html += f"<td>{parts[5]}</td>"
-        # PercentUsed
-        table_html += f"<td>{parts[6]}</td>"
-        # Active
-        table_html += f"<td>{parts[7]}</td>"
-        table_html += "</tr>"
-
-    table_html += "</table>"
-
-    return table_html
+        table_html += _table_row((parts[0], f"{parts[1]} {parts[2]}", *parts[3:8]))
+    return table_html + "</table>"
 
 
 # ---------------------------------------------------------------------------
@@ -2374,6 +2318,24 @@ def _run_in_job(jobid, argv):
     return completed.stdout.decode("utf-8", "replace")
 
 
+# What _gpu_cells reads off one GPU. A source that lacks a reading leaves it None;
+# the windows and sample counts say what an average was taken over.
+GPU_ROW_KEYS = ("index", "name", "util", "util_window_s", "util_n", "mem_used_mb",
+                "mem_total_mb", "power", "power_window_s", "power_n", "power_limit", "temp")
+
+
+def _gpu_row(source, **readings):
+    """One GPU's readings as _gpu_cells takes them, the rest None."""
+    unknown = set(readings) - set(GPU_ROW_KEYS)
+    if unknown:
+        raise TypeError(f"unknown GPU readings {sorted(unknown)}")
+    row = dict.fromkeys(GPU_ROW_KEYS)
+    row.update(readings, source=source)
+    if row["name"] is not None:
+        row["name"] = re.sub(r"^NVIDIA\s+", "", row["name"])
+    return row
+
+
 def _probe_gpu_nvml(jobid):
     """Read the job's GPUs through NVML, averages included; None if it failed.
 
@@ -2396,23 +2358,21 @@ def _probe_gpu_nvml(jobid):
         except ValueError as exc:
             print(f"Warning: unreadable gpu_probe line {line[:80]!r} for job {jobid}: {exc}")
             continue
-        gpus.append(
-            {
-                "index": card["index"],
-                "name": re.sub(r"^NVIDIA\s+", "", card["name"] or "GPU"),
-                "util": card["util_avg"],
-                "util_window_s": card["util_window_s"],
-                "util_n": card["util_n"],
-                "mem_used_mb": card["mem_used_mb"],
-                "mem_total_mb": card["mem_total_mb"],
-                "power": card["power_avg_w"],
-                "power_window_s": card["power_window_s"],
-                "power_n": card["power_n"],
-                "power_limit": card["power_limit_w"],
-                "temp": card["temp_c"],
-                "source": "nvml",
-            }
-        )
+        gpus.append(_gpu_row(
+            "nvml",
+            index=card["index"],
+            name=card["name"] or "GPU",
+            util=card["util_avg"],
+            util_window_s=card["util_window_s"],
+            util_n=card["util_n"],
+            mem_used_mb=card["mem_used_mb"],
+            mem_total_mb=card["mem_total_mb"],
+            power=card["power_avg_w"],
+            power_window_s=card["power_window_s"],
+            power_n=card["power_n"],
+            power_limit=card["power_limit_w"],
+            temp=card["temp_c"],
+        ))
     if not gpus:
         print(f"Warning: gpu_probe of job {jobid} returned no GPU, ignoring it")
         return None
@@ -2442,23 +2402,17 @@ def _probe_gpu_smi(jobid):
             print(f"Warning: unexpected nvidia-smi row {line!r} for job {jobid}, skipping")
             continue
         index, name, util, mem_used, mem_total, power, power_limit, temp = parts
-        gpus.append(
-            {
-                "index": index,
-                "name": re.sub(r"^NVIDIA\s+", "", name),
-                "util": _smi_number(util, jobid, "utilization.gpu"),
-                "util_window_s": None,
-                "util_n": None,
-                "mem_used_mb": _smi_number(mem_used, jobid, "memory.used"),
-                "mem_total_mb": _smi_number(mem_total, jobid, "memory.total"),
-                "power": _smi_number(power, jobid, "power.draw"),
-                "power_window_s": None,
-                "power_n": None,
-                "power_limit": _smi_number(power_limit, jobid, "power.limit"),
-                "temp": _smi_number(temp, jobid, "temperature.gpu"),
-                "source": "nvidia-smi",
-            }
-        )
+        gpus.append(_gpu_row(
+            "nvidia-smi",
+            index=index,
+            name=name,
+            util=_smi_number(util, jobid, "utilization.gpu"),
+            mem_used_mb=_smi_number(mem_used, jobid, "memory.used"),
+            mem_total_mb=_smi_number(mem_total, jobid, "memory.total"),
+            power=_smi_number(power, jobid, "power.draw"),
+            power_limit=_smi_number(power_limit, jobid, "power.limit"),
+            temp=_smi_number(temp, jobid, "temperature.gpu"),
+        ))
     if not gpus:
         print(f"Warning: nvidia-smi probe of job {jobid} returned no GPU, ignoring it")
         return None
@@ -2549,23 +2503,12 @@ def _accounting_gpu_row(counters):
         return None
     if counters["gpu_util"] is None and counters["gpu_mem_mb"] is None:
         return None
-    return [
-        {
-            "index": None,
-            "name": None,
-            "util": counters["gpu_util"],
-            "util_window_s": ACCOUNTING_SAMPLE_SECONDS,
-            "util_n": None,
-            "mem_used_mb": counters["gpu_mem_mb"],
-            "mem_total_mb": None,
-            "power": None,
-            "power_window_s": None,
-            "power_n": None,
-            "power_limit": None,
-            "temp": None,
-            "source": "accounting",
-        }
-    ]
+    return [_gpu_row(
+        "accounting",
+        util=counters["gpu_util"],
+        util_window_s=ACCOUNTING_SAMPLE_SECONDS,
+        mem_used_mb=counters["gpu_mem_mb"],
+    )]
 
 
 def _cpu_cell(cores, recent, alloc_cpus, span):
@@ -2714,9 +2657,7 @@ def parse_my_jobs_to_table():
     now = time.time()
     columns = ("JOB", "PARTITION", "ELAPSED", "CPU", "RAM",
                "GPU", "UTIL", "GPU MEM", "POWER", "TEMP")
-    html = ["<table>", "<tr>"]
-    html += [f"<th>{column}</th>" for column in columns]
-    html.append("</tr>")
+    html = ["<table>", _table_row(columns, "th")]
 
     stale_cpu = False
     accounting_only = False
@@ -2866,26 +2807,27 @@ def main():
 
     @app.route("/time_feed")
     def time_feed():
-        def generate():
-            yield f'updated at: {datetime.now(pytz.timezone("America/New_York")).strftime("%Y.%m.%d | %H:%M:%S")}'
+        now = datetime.now(pytz.timezone("America/New_York"))
+        return Response(f'updated at: {now.strftime("%Y.%m.%d | %H:%M:%S")}', mimetype="text")
 
-        return Response(generate(), mimetype="text")
+    # The panels that are one builder each: (endpoint, builder, follows the
+    # account picker). index.html fetches them by these endpoint names.
+    for endpoint, build, by_account in (
+        ("resource", parse_usage_to_table, False),
+        ("queue", parse_queue_to_table, True),
+        ("running", parse_running_to_table, True),
+        ("queue_stats", parse_queue_stats_to_table, False),
+        ("priority", parse_priority_to_table, True),
+        ("leaderboard", parse_leaderboard, False),
+        ("disk_quota", parse_disk_quota, False),
+        ("allocations", parse_allocations_to_table, True),
+        ("my_jobs", parse_my_jobs_to_table, False),
+    ):
+        def panel(build=build, by_account=by_account):
+            account = (selected_account(request.args),) if by_account else ()
+            return slurm_response(build, *account)
 
-    @app.route("/resource")
-    def resource():
-        return slurm_response(parse_usage_to_table)
-
-    @app.route("/queue")
-    def queue():
-        return slurm_response(parse_queue_to_table, selected_account(request.args))
-
-    @app.route("/running")
-    def running():
-        return slurm_response(parse_running_to_table, selected_account(request.args))
-
-    @app.route("/queue_stats")
-    def queue_stats():
-        return slurm_response(parse_queue_stats_to_table)
+        app.add_url_rule(f"/{endpoint}", endpoint, panel)
 
     @app.route("/wait_estimate")
     def wait_estimate():
@@ -2900,26 +2842,6 @@ def main():
             )
 
         return slurm_response(parse_wait_estimate_to_table, job)
-
-    @app.route("/priority")
-    def priority():
-        return slurm_response(parse_priority_to_table, selected_account(request.args))
-
-    @app.route("/leaderboard")
-    def leaderboard():
-        return slurm_response(parse_leaderboard)
-
-    @app.route("/disk_quota")
-    def disk_quota():
-        return slurm_response(parse_disk_quota)
-
-    @app.route("/allocations")
-    def allocations():
-        return slurm_response(parse_allocations_to_table, selected_account(request.args))
-
-    @app.route("/my_jobs")
-    def my_jobs():
-        return slurm_response(parse_my_jobs_to_table)
 
     app.run(host=args.host, port=args.port)
 

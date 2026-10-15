@@ -83,7 +83,7 @@
 
 <hr>
 <details class="section" id="sec-allocations">
-    <summary> Allocations for <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Allocations for <span class="acct-name">{{ accounts[0] }}</span></summary>
     <div class='table_big' id='allocations'> </div>
 </details>
 <br>
@@ -97,7 +97,7 @@
 
 <hr>
 <details class="section" id="sec-wait_estimate">
-    <summary> Estimated Wait for a Standard Job in <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Estimated Wait for a Standard Job in <span class="acct-name">{{ accounts[0] }}</span></summary>
     <form class="job-form" id="jobForm" onsubmit="updateWaitEstimate(); return false;">
         <label>GPUs <input type="text" id="jobGpus" value="1" size="4"></label>
         <label>CPUs <input type="text" id="jobCpus" value="auto" size="5"
@@ -114,21 +114,21 @@
 
 <hr>
 <details class="section" id="sec-priority">
-    <summary> Priority of <span class="acct-name">uva_cv_lab</span> in Each Pool</summary>
+    <summary> Priority of <span class="acct-name">{{ accounts[0] }}</span> in Each Pool</summary>
     <div class='table_big' id='priority'> </div>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-running">
-    <summary> Running Jobs of <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Running Jobs of <span class="acct-name">{{ accounts[0] }}</span></summary>
     <pre class='terminal' id="running"> </pre>
 </details>
 <br>
 
 <hr>
 <details class="section" id="sec-queue">
-    <summary> Waiting Queue of <span class="acct-name">uva_cv_lab</span></summary>
+    <summary> Waiting Queue of <span class="acct-name">{{ accounts[0] }}</span></summary>
     <pre class='terminal' id="queue"> </pre>
 </details>
 
@@ -144,7 +144,6 @@
 
 </html>
 
-<!-- Update content every {interval} ms -->
 <script>
     // Every endpoint is fetched relative to this page rather than from the site
     // root. Served directly the two are the same, but behind OnDemand's
@@ -153,17 +152,7 @@
     // index page is always the app root, so its own path is the prefix.
     var BASE = location.pathname.replace(/\/?$/, "/");
 
-    // Remove all setInterval calls and change to manual update
-    var clock = document.getElementById("clock");
-    var disk_quota = document.getElementById("disk_quota");
-    var resource = document.getElementById("resource");
-    var queue = document.getElementById("queue");
-    var running = document.getElementById("running");
-    var queue_stats = document.getElementById("queue_stats");
     var wait_estimate = document.getElementById("wait_estimate");
-    var priority = document.getElementById("priority");
-    var leaderboard = document.getElementById("leaderboard");
-    var allocations = document.getElementById("allocations");
     var my_jobs = document.getElementById("my_jobs");
     var myJobsSection = document.getElementById("sec-my_jobs");
     var updateButton = document.getElementById("updateButton");
@@ -235,7 +224,6 @@
     window.onload = updateAll;
 
     var jobFields = {gpus: "jobGpus", cpus: "jobCpus", mem: "jobMem", hours: "jobHours"};
-    var jobDefaults = {gpus: "1", cpus: "auto", mem: "auto", hours: "{{ standard_hours }}"};
 
     // The form lives outside #wait_estimate so it survives every refresh.
     Object.keys(jobFields).forEach(function (key) {
@@ -243,9 +231,12 @@
         if (stored !== null) document.getElementById(jobFields[key]).value = stored;
     });
 
+    // Reset goes back to each field's value attribute, which the restore above
+    // leaves alone.
     function resetJobForm() {
         Object.keys(jobFields).forEach(function (key) {
-            document.getElementById(jobFields[key]).value = jobDefaults[key];
+            var field = document.getElementById(jobFields[key]);
+            field.value = field.defaultValue;
             localStorage.removeItem("job:" + key);
         });
         updateWaitEstimate();
@@ -329,19 +320,24 @@
         updateButton.disabled = true;
         updateButton.textContent = "Updating...";
 
+        // [what it shows, element id, endpoint, follows the account picker]
         var tasks = [
-            panelTask("the clock", clock, BASE + "{{ url_for('time_feed')[1:] }}"),
-            panelTask("resource info", resource, BASE + "{{ url_for('resource')[1:] }}"),
-            panelTask("queue stats", queue_stats, BASE + "{{ url_for('queue_stats')[1:] }}"),
-            panelTask("priority ranking", priority, BASE + "{{ url_for('priority')[1:] }}?" + accountParam()),
-            panelTask("running jobs", running, BASE + "{{ url_for('running')[1:] }}?" + accountParam()),
-            panelTask("queue info", queue, BASE + "{{ url_for('queue')[1:] }}?" + accountParam()),
-            panelTask("the leaderboard", leaderboard, BASE + "{{ url_for('leaderboard')[1:] }}"),
-            panelTask("allocations", allocations, BASE + "{{ url_for('allocations')[1:] }}?" + accountParam()),
-            panelTask("disk quota", disk_quota, BASE + "{{ url_for('disk_quota')[1:] }}"),
-            // These two write their own error message, so they need no wrapper.
-            updateWaitEstimate,
-        ];
+            ["the clock", "clock", "{{ url_for('time_feed')[1:] }}", false],
+            ["resource info", "resource", "{{ url_for('resource')[1:] }}", false],
+            ["queue stats", "queue_stats", "{{ url_for('queue_stats')[1:] }}", false],
+            ["priority ranking", "priority", "{{ url_for('priority')[1:] }}", true],
+            ["running jobs", "running", "{{ url_for('running')[1:] }}", true],
+            ["queue info", "queue", "{{ url_for('queue')[1:] }}", true],
+            ["the leaderboard", "leaderboard", "{{ url_for('leaderboard')[1:] }}", false],
+            ["allocations", "allocations", "{{ url_for('allocations')[1:] }}", true],
+            ["disk quota", "disk_quota", "{{ url_for('disk_quota')[1:] }}", false],
+        ].map(function (p) {
+            var url = BASE + p[2] + (p[3] ? "?" + accountParam() : "");
+            return panelTask(p[0], document.getElementById(p[1]), url);
+        });
+        // The wait estimate and my jobs write their own error message, so they
+        // need no wrapper.
+        tasks.push(updateWaitEstimate);
         if (myJobsSection.open && Date.now() - myJobsFetchedAt > MY_JOBS_MIN_GAP_MS) {
             tasks.push(updateMyJobs);
         }
@@ -431,7 +427,8 @@
         padding: 8px;
     }
     
-    /* 只对用户列应用文字溢出处理，其他列正常显示 */
+    /* The last column of every table (users, node lists, reasons) is cut with
+       an ellipsis instead of widening the page. */
     td:last-child {
         white-space: nowrap;
         overflow: hidden;

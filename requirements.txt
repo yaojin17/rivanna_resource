@@ -2,6 +2,5 @@ numpy
 beartype
 colored
 flask
-humanfriendly
 pandas
 pytz

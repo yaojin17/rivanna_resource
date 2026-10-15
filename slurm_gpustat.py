@@ -27,14 +27,18 @@ for _blas_var in (
     os.environ.setdefault(_blas_var, "1")
 
 import colored
-import humanfriendly as hf
 from beartype import beartype
 
 
-# SLURM states which indicate that the node is not available for submitting jobs
-INACCESSIBLE = {"drain*", "down*", "drng", "drain", "down"}
-INACCESSIBLE_KEYWORDS = ("down", "drain", "drng", "resv", "inval", "plnd", "pow_up", "reboot")
-INTERACTIVE_CMDS = {"bash", "zsh", "sh"}
+# Words in a SLURM node state meaning no job can be sent there: the node is down
+# or draining, or held back (reserved, planned, rebooting, powering up).
+DOWN_STATE_KEYWORDS = ("down", "drain", "drng", "inval")
+RESV_STATE_KEYWORDS = ("resv", "plnd", "reboot", "pow_up")
+INACCESSIBLE_KEYWORDS = DOWN_STATE_KEYWORDS + RESV_STATE_KEYWORDS
+# Stands in for the type of a GPU whose gres names none.
+NONAME_GPU = "NONAME_GPU"
+# GPUs assumed on a node whose gres gives no count.
+DEFAULT_GPU_COUNT = 4
 # How hard parse_cmd tries before letting a SLURM query fail, see its docstring.
 SLURM_RETRIES = 3
 SLURM_RETRY_DELAY = 1.0
@@ -57,10 +61,7 @@ LAB_ACCOUNTS = tuple(
 
 
 def is_inaccessible(state: str) -> bool:
-    state_lower = state.lower().rstrip("*~$#%")
-    if state_lower in INACCESSIBLE:
-        return True
-    return any(kw in state_lower for kw in INACCESSIBLE_KEYWORDS)
+    return any(kw in state.lower() for kw in INACCESSIBLE_KEYWORDS)
 
 
 def split_node_str(node_str):
@@ -139,9 +140,6 @@ CMD_CACHE_SECONDS = int(os.environ.get("RIVANNA_CMD_CACHE_SECONDS", "10"))
 # sstat readings are subtracted from one another to turn counters into a rate, so
 # two calls a few seconds apart have to be two different readings.
 UNCACHEABLE_COMMANDS = ("sstat",)
-_cmd_cache = {}
-_cmd_cache_guard = threading.Lock()
-_cmd_locks = {}
 
 
 def _cmd_is_cacheable(cmd):
@@ -151,7 +149,7 @@ def _cmd_is_cacheable(cmd):
     return head not in UNCACHEABLE_COMMANDS
 
 
-def _run_slurm_cmd(cmd, split, retries, delay):
+def _run_slurm_cmd(cmd, split):
     """Parse the output of a shell command...
      and if split set to true: split into a list of strings, one per line of output.
 
@@ -167,14 +165,13 @@ def _run_slurm_cmd(cmd, split, retries, delay):
     Args:
         cmd (str): the shell command to be executed.
         split (bool): whether to split the output per line
-        retries (int): how many times to run the command before giving up.
-        delay (float): seconds to wait between attempts.
     Returns:
         (list[str]): the strings from each output line.
     Raises:
         subprocess.CalledProcessError: if the command ran and failed every time.
         OSError: if the command could not be started at all.
     """
+    retries, delay = SLURM_RETRIES, SLURM_RETRY_DELAY
     for attempt in range(1, retries + 1):
         try:
             output = subprocess.check_output(
@@ -188,8 +185,7 @@ def _run_slurm_cmd(cmd, split, retries, delay):
             else:
                 detail = f"could not be started: {exc}"
             if attempt == retries:
-                if retries > 1:
-                    print(f"Warning: `{cmd}` still failing after {retries} attempts ({detail})")
+                print(f"Warning: `{cmd}` still failing after {retries} attempts ({detail})")
                 raise
             print(
                 f"Warning: `{cmd}` failed ({detail}); "
@@ -201,69 +197,60 @@ def _run_slurm_cmd(cmd, split, retries, delay):
     return output
 
 
-def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
+def ttl_cache(seconds):
+    """Cache a function's results per argument tuple for ``seconds``.
+
+    A caller asking while the same call is still running waits for its result
+    rather than starting a second copy, which a plain expiry would miss when a
+    page fires all its panels at once. A call that raises is not cached, and
+    expired entries are dropped whenever a new result is stored.
+    """
+    def decorate(func):
+        cache, locks = {}, {}
+        guard = threading.Lock()
+
+        def fresh(args):
+            with guard:
+                hit = cache.get(args)
+            return hit if hit is not None and time.monotonic() - hit[0] < seconds else None
+
+        @functools.wraps(func)
+        def cached(*args):
+            hit = fresh(args)
+            if hit is None:
+                with guard:
+                    lock = locks.setdefault(args, threading.Lock())
+                with lock:
+                    # Whoever held the lock may just have stored the answer.
+                    hit = fresh(args)
+                    if hit is None:
+                        value = func(*args)
+                        now = time.monotonic()
+                        with guard:
+                            for key in [k for k, (stamp, _) in cache.items() if now - stamp >= seconds]:
+                                del cache[key]
+                            hit = cache[args] = (now, value)
+            return hit[1]
+        return cached
+    return decorate
+
+
+@ttl_cache(CMD_CACHE_SECONDS)
+def _cached_cmd(cmd, split):
+    return _run_slurm_cmd(cmd, split)
+
+
+def parse_cmd(cmd, split=True):
     """Run a SLURM query, reusing an answer from the last CMD_CACHE_SECONDS.
 
     See :func:`_run_slurm_cmd` for what actually runs and why it retries.
     """
     if not _cmd_is_cacheable(cmd):
-        return _run_slurm_cmd(cmd, split, retries, delay)
-
-    key = (cmd, split)
-
-    def _fresh():
-        """The cached answer if it is still young enough, else None."""
-        with _cmd_cache_guard:
-            entry = _cmd_cache.get(key)
-        if entry is None or time.monotonic() - entry[0] >= CMD_CACHE_SECONDS:
-            return None
-        # Callers get their own list, so one of them sorting it in place cannot
-        # reshuffle what the next caller reads out of the cache.
-        return list(entry[1]) if isinstance(entry[1], list) else entry[1]
-
-    hit = _fresh()
-    if hit is not None:
-        return hit
-
-    with _cmd_cache_guard:
-        lock = _cmd_locks.setdefault(key, threading.Lock())
-    with lock:
-        # Whoever held this lock has just filled the cache, so look again before
-        # running a second copy of their command.
-        hit = _fresh()
-        if hit is not None:
-            return hit
-        output = _run_slurm_cmd(cmd, split, retries, delay)
-        with _cmd_cache_guard:
-            _cmd_cache[key] = (time.monotonic(), output)
+        return _run_slurm_cmd(cmd, split)
+    output = _cached_cmd(cmd, split)
+    # Callers get their own list, so one of them sorting it in place cannot
+    # reshuffle what the next caller reads out of the cache.
     return list(output) if isinstance(output, list) else output
-
-
-def ttl_cache(seconds):
-    """Cache a function's results per argument tuple for ``seconds``.
-
-    Expired entries are dropped whenever a new result is stored, so the cache only
-    ever holds what was asked for within the last ``seconds``.
-    """
-    def decorate(func):
-        cache = {}
-        guard = threading.Lock()
-
-        @functools.wraps(func)
-        def cached(*args):
-            now = time.monotonic()
-            with guard:
-                hit = cache.get(args)
-            if hit is not None and now - hit[0] < seconds:
-                return hit[1]
-            value = func(*args)
-            with guard:
-                for key in [k for k, (stamp, _) in cache.items() if now - stamp >= seconds]:
-                    del cache[key]
-                cache[args] = (now, value)
-            return value
-        return cached
-    return decorate
 
 
 def squeue_fields(args: str, fields) -> list:
@@ -299,16 +286,20 @@ JOB_FIELDS = (
 )
 
 
-def squeue_jobs(state: str, partitions: Optional[str] = None) -> list:
+def squeue_jobs(state: str, partitions: Optional[str] = None,
+                account: Optional[str] = None) -> list:
     """Every job squeue -t ``state`` lists, as JOB_FIELDS dicts in squeue's order.
 
     ``partitions`` (comma separated) keeps the jobs ``squeue --partition`` would:
-    those with any of them among the partitions they list.
+    those with any of them among the partitions they list. ``account`` keeps
+    that account's jobs.
     """
     jobs = squeue_fields(f"-a -h -t {state}", JOB_FIELDS)
     if partitions:
         wanted = set(partitions.split(","))
         jobs = [job for job in jobs if wanted & set(job["partition"].split(","))]
+    if account:
+        jobs = [job for job in jobs if job["account"] == account]
     return jobs
 
 
@@ -348,6 +339,12 @@ def mem_to_mb(text):
     value = float(match.group(1))
     scale = {"": 1, "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}[match.group(2)]
     return int(value * scale)
+
+
+def mem_to_bytes(text):
+    """:func:`mem_to_mb` in bytes, None when ``text`` is not a size."""
+    mb = mem_to_mb(text)
+    return None if mb is None else mb * 1024 ** 2
 
 
 def alloc_gpu_count(tres):
@@ -423,6 +420,41 @@ def node_states(partition: Optional[str] = None) -> dict:
     return states
 
 
+def partition_nodes() -> dict:
+    """Map every monitored partition that has nodes to the set of its nodes."""
+    rows = parse_cmd(f"sinfo -h -p {MONITORED_PARTITIONS} -o '%P|%N'")
+    nodes = defaultdict(set)
+    for row in rows:
+        tokens = row.split("|")
+        if len(tokens) < 2:
+            print(f"Warning: unexpected sinfo node row {row!r}, skipping")
+            continue
+        nodes[tokens[0].strip().rstrip("*")] |= set(parse_node_names(tokens[1].strip()))
+    return nodes
+
+
+def split_by_access(resources: dict, states: dict, reserved: Optional[dict] = None):
+    """Split ``resources`` into the nodes a job can be sent to and the rest.
+
+    A node missing from ``states`` counts as down, and one in ``reserved``
+    (``{node: reservation}``) as closed whatever its state. Returns
+    ``(accessible, closed, reasons)``; ``reasons`` says why each closed node is
+    closed and is what gpu_usage takes as ``excluded``.
+    """
+    reserved = reserved or {}
+    accessible, closed, reasons = {}, {}, {}
+    for node, gpus in resources.items():
+        if node in reserved:
+            reasons[node] = f"reserved for {reserved[node]}"
+        elif is_inaccessible(states.get(node, "down")):
+            reasons[node] = f"in state {states.get(node, 'missing from sinfo')}"
+        else:
+            accessible[node] = gpus
+            continue
+        closed[node] = gpus
+    return accessible, closed, reasons
+
+
 def format_size(size_in_bytes):
     """Format size in bytes to human readable string (G or T)."""
     size_in_gb = size_in_bytes / (1024 ** 3)
@@ -475,7 +507,7 @@ def avail_stats_for_node(node: str) -> dict:
 
     Returns ``{"cpu": (free, total), "mem": (free bytes, total bytes)}``. SLURM
     sometimes writes large memory sizes oddly (68G next to 257669M), so they go
-    through humanfriendly's parser rather than being compared as text.
+    through mem_to_bytes rather than being compared as text.
     """
     record = node_records().get(node)
     if record is None:
@@ -485,12 +517,13 @@ def avail_stats_for_node(node: str) -> dict:
         print(f"Warning: node {node} reported no TRES totals, showing it as empty")
         return {"cpu": (0, 0), "mem": (0, 0)}
     cfg, alloc = _tres_dict(record["CfgTRES"]), _tres_dict(record["AllocTRES"])
-    stats = {}
-    for metric in ("cpu", "mem"):
-        total = hf.parse_size(cfg[metric], binary=metric == "mem")
-        used = hf.parse_size(alloc.get(metric, "0"), binary=metric == "mem")
-        stats[metric] = (total - used, total)
-    return stats
+    mem_total, mem_used = mem_to_bytes(cfg["mem"]), mem_to_bytes(alloc.get("mem", "0"))
+    if mem_total is None or mem_used is None:
+        print(f"Warning: node {node} reported unreadable memory {cfg['mem']!r}/"
+              f"{alloc.get('mem')!r}, showing it as empty")
+        return {"cpu": (0, 0), "mem": (0, 0)}
+    cpu_total, cpu_used = int(cfg["cpu"]), int(alloc.get("cpu", "0"))
+    return {"cpu": (cpu_total - cpu_used, cpu_total), "mem": (mem_total - mem_used, mem_total)}
 
 
 def occupancy_stats_for_node(node: str) -> dict:
@@ -501,25 +534,26 @@ def occupancy_stats_for_node(node: str) -> dict:
     for metric, alloc_val in _tres_dict(record.get("AllocTRES", "")).items():
         cfg_val = cfg[metric]
         if metric == "mem":
-            alloc_val = format_size(hf.parse_size(alloc_val, binary=True))
-            cfg_val = format_size(hf.parse_size(cfg_val, binary=True))
+            sizes = mem_to_bytes(alloc_val), mem_to_bytes(cfg_val)
+            if None in sizes:
+                print(f"Warning: node {node} reported unreadable memory "
+                      f"{alloc_val!r}/{cfg_val!r}, showing it as given")
+            else:
+                alloc_val, cfg_val = map(format_size, sizes)
         occupancy[metric] = f"{alloc_val}/{cfg_val}"
     return occupancy
 
 
 @beartype
-def parse_all_gpus(partition: Optional[str] = None,
-                   default_gpus: int = 4,
-                   default_gpu_name: str = "NONAME_GPU") -> dict:
+def parse_all_gpus(partition: Optional[str] = None) -> dict:
     """Query SLURM for the number and types of GPUs under management.
+
+    A gres that names no type counts as NONAME_GPU, and one that gives no count
+    as DEFAULT_GPU_COUNT GPUs.
 
     Args:
         partition: the partition/queue (or multiple, comma separated) of interest.
             By default None, which queries all available partitions.
-        default_gpus: The number of GPUs estimated for nodes that have incomplete SLURM
-            meta data.
-        default_gpu_name: The name of the GPU for nodes that have incomplete SLURM meta
-        data.
 
     Returns:
         a mapping between node names and a list of the GPUs that they have available.
@@ -535,9 +569,8 @@ def parse_all_gpus(partition: Optional[str] = None,
     for row in rows:
         node_str, resource_strs = row.split("|")
         for gpu_type, gpu_count in parse_gres_gpus(resource_strs):
-            gpu_type = gpu_type or default_gpu_name
-            # if the number of GPUs is not specified, we assume it is `default_gpus`
-            gpu_count = default_gpus if gpu_count is None else gpu_count
+            gpu_type = gpu_type or NONAME_GPU
+            gpu_count = DEFAULT_GPU_COUNT if gpu_count is None else gpu_count
             for name in parse_node_names(node_str):
                 resources[name].append({"type": gpu_type, "count": gpu_count})
     return resources
@@ -578,30 +611,6 @@ def summary_by_type(resources: dict, tag: str):
     print("\n".join(agg_str))
 
 
-@beartype
-def summary(mode: str, resources: dict = None, states: dict = None):
-    """Generate a printed summary of the cluster resources.
-
-    Args:
-        mode (str): the kind of resources to query (must be one of 'accessible', 'up').
-        resources (dict :: None): a summary of cluster resources, organised by node name.
-        states (dict[str: str] :: None): a mapping between node names and SLURM states.
-    """
-    if not resources:
-        resources = parse_all_gpus()
-    if not states:
-        states = node_states()
-    if mode == "accessible":
-        res = {key: val for key, val in resources.items()
-               if not is_inaccessible(states.get(key, "down"))}
-    elif mode == "up":
-        res = resources
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-    summary_by_type(res, tag=mode)
-
-
-@functools.lru_cache(maxsize=1)
 def _gpus_per_node_from_alloc(num_nodes: str, tres_alloc: str, jobid: str) -> int:
     """GPUs per node for a job whose tres-per-node names none.
 
@@ -723,14 +732,12 @@ def subtract_usage(resources: dict, usage: dict) -> None:
 
 
 @beartype
-def in_use(resources: dict = None, partition: Optional[str] = None):
+def in_use(resources: dict, partition: Optional[str] = None):
     """Print a short summary of the resources that are currently used by each user.
 
     Args:
         resources: a summary of cluster resources, organised by node name.
     """
-    if not resources:
-        resources = parse_all_gpus()
     aggregates = aggregate_usage(gpu_usage(resources, partition=partition))
     print("Usage by user:")
     for user, subdict in sorted(aggregates.items(),
@@ -742,16 +749,13 @@ def in_use(resources: dict = None, partition: Optional[str] = None):
 
 
 @beartype
-def available(
-        resources: dict = None,
-        states: dict = None,
-        verbose: bool = False,
-):
+def available(res: dict, excluded: dict, verbose: bool = False):
     """Print a short summary of resources available on the cluster.
 
     Args:
-        resources: a summary of cluster resources, organised by node name.
-        states: a mapping between node names and SLURM states.
+        res: the accessible nodes' resources, organised by node name; the GPUs in
+            use are subtracted from it in place.
+        excluded: why each node left out of ``res`` was, see gpu_usage.
         verbose: whether to output a more verbose summary of the cluster state.
 
     NOTES: Some systems allow users to share GPUs.  The logic below amounts to a
@@ -761,14 +765,6 @@ def available(
       until all GPUs on the server are assigned.  If more GPUs than this are listed as
       allocated by squeue, we assume any further GPU usage occurs by sharing GPUs.
     """
-    if not resources:
-        resources = parse_all_gpus()
-    if not states:
-        states = node_states()
-    res = {key: val for key, val in resources.items()
-           if not is_inaccessible(states.get(key, "down"))}
-    excluded = {node: f"in state {states.get(node, 'missing from sinfo')}"
-                for node in resources if node not in res}
     usage = gpu_usage(resources=res, excluded=excluded)
     subtract_usage(res, usage)
     by_type = resource_by_type(res)
@@ -793,23 +789,21 @@ def available(
 
 def all_info(color: int, verbose: bool, partition: Optional[str] = None):
     divider, slurm_str = "---------------------------------", "SLURM"
-    # Use only verified color names from `colored` library
-    colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "black"]
     if color:
-        divider = colored.fg(colors[7]) + divider + colored.attr("reset")
-        slurm_str = colored.fg(colors[0]) + slurm_str + colored.attr("reset")
+        divider = colored.fg("black") + divider + colored.attr("reset")
+        slurm_str = colored.fg("red") + slurm_str + colored.attr("reset")
     print(divider)
     print(f"Under {slurm_str} management")
     print(divider)
-    # Remaining function logic...
     resources = parse_all_gpus(partition=partition)
-    states = node_states(partition=partition)
-    for mode in ("up", "accessible"):
-        summary(mode=mode, resources=resources, states=states)
-        print(divider)
+    accessible, _, excluded = split_by_access(resources, node_states(partition=partition))
+    summary_by_type(resources, tag="up")
+    print(divider)
+    summary_by_type(accessible, tag="accessible")
+    print(divider)
     in_use(resources, partition=partition)
     print(divider)
-    available(resources=resources, states=states, verbose=verbose)
+    available(accessible, excluded, verbose=verbose)
     print(divider)
 
 def main():

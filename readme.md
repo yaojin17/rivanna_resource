@@ -77,7 +77,8 @@ python available_resources.py    # only what is free
   usage-logging daemon (`--action`). Queue Overview counts only jobs queued for the
   monitored partitions, `RIVANNA_STANDARD_HOURS` now sets the walltime the form starts
   with, and the app's warnings reach `app.log` as they happen instead of being lost
-  on restart.
+  on restart. The app no longer needs humanfriendly, and `slurm_gpustat.py -p` on a
+  partition without GPUs reports none instead of the whole cluster's.
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts
