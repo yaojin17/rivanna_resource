@@ -72,8 +72,9 @@ python available_resources.py    # only what is free
   groups. Estimated Wait runs its SLURM queries side by side (about twice as fast from
   cold), `available_resources.py` reads the node table once instead of once per node,
   and the app no longer needs django or humanize. The panels share one `squeue` read
-  per job state, and Queue Overview now counts every task of a pending array with a
-  long task list, which the old read cut short. `slurm_gpustat.py` drops its unused
+  per job state, and Queue Overview, Waiting Queue and Estimated Wait count every task
+  of a pending array however long its task list: squeue cuts the list at 64 bytes, and
+  one array counted 145 of its 433 tasks. `slurm_gpustat.py` drops its unused
   usage-logging daemon (`--action`). Queue Overview counts only jobs queued for the
   monitored partitions, `RIVANNA_STANDARD_HOURS` now sets the walltime the form starts
   with, and the app's warnings reach `app.log` as they happen instead of being lost

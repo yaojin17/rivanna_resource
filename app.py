@@ -994,6 +994,21 @@ def _array_task_count(tasks):
     return 1 if tasks in ("", "N/A") else _expand_array_tasks(tasks)[0]
 
 
+# How much of an array's task list a JOBID cell shows: what squeue's default
+# output fits before it ends the list with "...".
+ARRAY_TASKS_SHOWN = 63
+
+
+def _short_tasks(tasks):
+    """An array's task list cut at a comma to ARRAY_TASKS_SHOWN characters and
+    ended with ``...``, throttle kept. For display only; counts use the full list."""
+    spec, sep, throttle = tasks.partition("%")
+    if len(spec) <= ARRAY_TASKS_SHOWN:
+        return tasks
+    cut = spec.rfind(",", 0, ARRAY_TASKS_SHOWN - 3)
+    return spec[: cut + 1] + "..." + sep + throttle
+
+
 def _sprio_rows():
     """``(jobid, partition, total, partition factor)`` strings, one per sprio row.
 
@@ -1941,8 +1956,8 @@ def parse_queue_to_table(account):
     from its allocated TRES. Both timestamps drop the year to keep the table narrow.
 
     squeue folds the not yet started tasks of an array into one row; its JOBID
-    carries their range the way squeue prints it, e.g. ``20478034_[155-742%4]``.
-    The last line totals the account's pending jobs and the GPUs they ask for,
+    carries their range the way squeue prints it, e.g. ``20478034_[155-742%4]``,
+    with a long list cut short (see :func:`_short_tasks`). The last line totals the account's pending jobs and the GPUs they ask for,
     counting each task of such a row.
     """
     columns = ("jobid", "arraytaskid", "partition", "username", "timelimit",
@@ -1958,7 +1973,7 @@ def parse_queue_to_table(account):
     ):
         count = _array_task_count(tasks)
         if count > 1:
-            jobid = f"{jobid}_[{tasks}]"
+            jobid = f"{jobid}_[{_short_tasks(tasks)}]"
         gpus = alloc_gpu_count(tres)
         total_jobs += count
         total_gpus += count * gpus

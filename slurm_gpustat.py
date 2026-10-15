@@ -277,10 +277,14 @@ def squeue_fields(args: str, fields) -> list:
     (width 0) and closed with ``|``. Only the last field may itself contain a
     ``|``, so free text such as a job name or pending reason goes last; a row
     that still does not split into ``fields`` is skipped with a warning.
+
+    A pending array's task list is cut to 64 bytes and ended with ``...``
+    whatever the width, unless SLURM_BITSTR_LEN is 0; cut, it hid 288 of the
+    433 tasks of one array.
     """
     fmt = ",".join(f"{name}:0|" for name in fields)
     entries = []
-    for row in parse_cmd(f"squeue {args} -O '{fmt}'"):
+    for row in parse_cmd(f"SLURM_BITSTR_LEN=0 squeue {args} -O '{fmt}'"):
         values = row.rstrip().removesuffix("|").split("|", len(fields) - 1)
         if len(values) != len(fields) or not row.rstrip().endswith("|"):
             print(f"Warning: squeue row does not split into {len(fields)} fields: "
