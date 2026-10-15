@@ -35,6 +35,10 @@ from beartype import beartype
 DOWN_STATE_KEYWORDS = ("down", "drain", "drng", "inval")
 RESV_STATE_KEYWORDS = ("resv", "plnd", "reboot", "pow_up")
 INACCESSIBLE_KEYWORDS = DOWN_STATE_KEYWORDS + RESV_STATE_KEYWORDS
+# sinfo ends the state of a node it cannot reach with this, and such a node gets no
+# new work whatever its state: a comp* node can sit for hours, its jobs stuck
+# finishing and its GPUs free on paper.
+NOT_RESPONDING = "*"
 # Stands in for the type of a GPU whose gres names none.
 NONAME_GPU = "NONAME_GPU"
 # GPUs assumed on a node whose gres gives no count.
@@ -77,7 +81,7 @@ LAB_ACCOUNTS = _lab_accounts()
 
 
 def is_inaccessible(state: str) -> bool:
-    return any(kw in state.lower() for kw in INACCESSIBLE_KEYWORDS)
+    return state.endswith(NOT_RESPONDING) or any(kw in state.lower() for kw in INACCESSIBLE_KEYWORDS)
 
 
 def split_node_str(node_str):
@@ -467,7 +471,8 @@ def split_by_access(resources: dict, states: dict, reserved: Optional[dict] = No
         if node in reserved:
             reasons[node] = f"reserved for {reserved[node]}"
         elif is_inaccessible(states.get(node, "down")):
-            reasons[node] = f"in state {states.get(node, 'missing from sinfo')}"
+            state = states.get(node, "missing from sinfo")
+            reasons[node] = f"in state {state}" + " (not responding)" * state.endswith(NOT_RESPONDING)
         else:
             accessible[node] = gpus
             continue

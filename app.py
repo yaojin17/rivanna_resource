@@ -50,6 +50,7 @@ from slurm_gpustat import (
     partition_nodes,
     DOWN_STATE_KEYWORDS,
     RESV_STATE_KEYWORDS,
+    NOT_RESPONDING,
     NONAME_GPU,
     parse_cmd,
     avail_stats_for_node,
@@ -193,7 +194,7 @@ def parse_leaderboard():
 def _state_badge(state):
     """Return an HTML badge for the node state."""
     s = state.lower()
-    if any(kw in s for kw in DOWN_STATE_KEYWORDS):
+    if s.endswith(NOT_RESPONDING) or any(kw in s for kw in DOWN_STATE_KEYWORDS):
         cls = "state-down"
     elif any(kw in s for kw in RESV_STATE_KEYWORDS + ("plan",)):
         cls = "state-resv"

@@ -90,6 +90,9 @@ python available_resources.py    # only what is free
   GPUs held on other nodes, and GPUs held by jobs from unmonitored partitions such as
   `bii-gpu` no longer show as available. Estimated Wait assumes a running job with no
   time limit keeps its share for the whole replay instead of warning on every refresh.
+  A node SLURM cannot reach (a state ending in `*`, such as `comp*`) counts as
+  offline everywhere: two B200 nodes stuck like that showed 14 GPUs as free that no
+  job could get.
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts
