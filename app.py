@@ -48,6 +48,7 @@ from slurm_gpustat import (
     avail_stats_for_node,
     parse_node_names,
     get_gpu_partitions,
+    squeue_fields,
     MONITORED_PARTITIONS,
 )
 
@@ -1295,26 +1296,25 @@ def _test_only_check(spec, account):
 
 
 # ------------------------------------------------------------ queue snapshot
-# squeue --Format pads every column to exactly the width asked for (and truncates
-# anything longer), so rows are sliced by position rather than split on
-# whitespace: nodelists have no spaces, but reasons do.
+# Read in full through squeue_fields: a fixed width would cut long node lists,
+# array specs and partition lists short.
 QUEUE_FORMAT = (
-    ("jobid", 32),
-    ("arrayjobid", 14),
-    ("arraytaskid", 28),
-    ("prioritylong", 14),
-    ("partition", 200),
-    ("account", 32),
-    ("state", 14),
-    ("endtime", 22),
-    ("nodelist", 400),
-    ("numnodes", 10),
-    ("timelimit", 14),
-    ("tres-per-node", 64),
-    ("tres-per-job", 48),
-    ("tres-per-task", 48),
-    ("tres-alloc", 300),
-    ("reason", 120),
+    "jobid",
+    "arrayjobid",
+    "arraytaskid",
+    "prioritylong",
+    "partition",
+    "account",
+    "state",
+    "endtime",
+    "nodelist",
+    "numnodes",
+    "timelimit",
+    "tres-per-node",
+    "tres-per-job",
+    "tres-per-task",
+    "tres-alloc",
+    "reason",
 )
 # Arrays with more pending tasks than this are cut down, with a warning: the
 # simulation would otherwise spend its time on a queue that cannot run anyway.
@@ -1326,17 +1326,10 @@ PLAN_HORIZON_DAYS = 30
 
 def _squeue_rows(extra_args):
     """Run squeue with QUEUE_FORMAT and return one dict per job."""
-    fmt = ",".join(f"{name}:{width}" for name, width in QUEUE_FORMAT)
-    rows = parse_cmd(f"squeue -a -h {extra_args} -O '{fmt}'")
     entries = []
-    for row in rows:
-        entry = {}
-        pos = 0
-        for name, width in QUEUE_FORMAT:
-            entry[name] = row[pos : pos + width].strip()
-            pos += width
+    for entry in squeue_fields(f"-a -h {extra_args}", QUEUE_FORMAT):
         if not entry["jobid"]:
-            print(f"Warning: squeue row without a job id {row[:80]!r}, skipping")
+            print(f"Warning: squeue row without a job id {entry!r}, skipping")
             continue
         entries.append(entry)
     return entries

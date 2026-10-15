@@ -55,7 +55,7 @@ SLURM_RETRY_DELAY = 1.0
 # a job was submitted to, not the node it runs on, so a partition left out here drops
 # every GPU its jobs hold -- even `gpu` and `interactive`, whose GPU nodes all belong
 # to one of the typed partitions as well.
-MONITORED_PARTITIONS = "gpu,gpu-a100-40,gpu-a100-80,gpu-a40,gpu-a6000,gpu-v100,gpu-b200,gpu-rtxpro6000,gpu-mig,gpu-mig-a100,gpu-mig-rtxpro6000,interactive,interactive-rtx2080,interactive-rtx3090,dedicated"
+MONITORED_PARTITIONS = "gpu,gpu-a100-40,gpu-a100-80,gpu-a40,gpu-a6000,gpu-v100,gpu-b200,gpu-rtxpro6000,gpu-mig,gpu-mig-rtxpro6000,interactive,interactive-rtx2080,interactive-rtx3090,dedicated"
 
 
 def is_inaccessible(state: str) -> bool:
@@ -475,6 +475,26 @@ def parse_cmd(cmd, split=True, retries=SLURM_RETRIES, delay=SLURM_RETRY_DELAY):
     return list(output) if isinstance(output, list) else output
 
 
+def squeue_fields(args: str, fields) -> list:
+    """Run ``squeue <args> -O`` over ``fields`` and return one dict per job.
+
+    Given a width, squeue -O cuts a field to it without a word, and a node list cut
+    inside its brackets cannot be parsed. So every field is asked for in full
+    (width 0) and closed with ``|``. A row whose field count is off -- a ``|``
+    inside some value -- is skipped with a warning.
+    """
+    fmt = ",".join(f"{name}:0|" for name in fields)
+    entries = []
+    for row in parse_cmd(f"squeue {args} -O '{fmt}'"):
+        values = row.split("|")
+        if len(values) != len(fields) + 1 or values[-1].strip():
+            print(f"Warning: squeue row has {len(values) - 1} fields, expected "
+                  f"{len(fields)}: {row[:120]!r}, skipping")
+            continue
+        entries.append({name: value.strip() for name, value in zip(fields, values)})
+    return entries
+
+
 @beartype
 def node_states(partition: Optional[str] = None) -> dict:
     """Query SLURM for the state of each managed node.
@@ -834,34 +854,29 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
     else:
         gpu_identifier = 'gpu'
 
-    columns = f"{resource_flag}:100,nodelist:100,username:100,jobid:100,BatchFlag:10"
+    columns = [resource_flag, "nodelist", "username", "jobid", "BatchFlag"]
     if int(slurm_version[0:2]) >= 21:
         # A job that asks with --gpus or --gpus-per-task has no tres-per-node;
         # its GPUs only show up in its allocation.
-        columns += ",NumNodes:10,tres-alloc:300"
+        columns += ["NumNodes", "tres-alloc"]
     # RUNNING only: a COMPLETING job still lists its nodes, but SLURM has
     # already given its GPUs back to the node and to the user's QOS limit.
-    cmd = f"squeue -a -t RUNNING -O {columns} --noheader"
+    args = "-a -t RUNNING --noheader"
     if partition:
-        cmd += f" --partition={partition}"
-    rows = parse_cmd(cmd)
+        args += f" --partition={partition}"
     usage = defaultdict(dict)
     # Tallied and reported once below rather than per job: these skips are routine
     # (CPU-only jobs, drained nodes) and a refresh walks hundreds of jobs.
     no_gpu_jobs = 0
     off_inventory = defaultdict(int)  # node -> GPUs held there that go uncounted
-    for row in rows:
-        tokens = row.split()
-        if len(tokens) < 5:
-            print(f"Warning: unexpected squeue row {row!r}, skipping")
-            continue
-        gpu_count_str, node_str, user, jobid, batch_flag = tokens[:5]
+    for job in squeue_fields(args, columns):
+        gpu_count_str, node_str, user, jobid, batch_flag = (job[c] for c in columns[:5])
         if gpu_count_str.startswith(gpu_identifier):
             gpu_count_tokens = gpu_count_str.split(":")
             if not gpu_count_tokens[-1].isdigit():
                 gpu_count_tokens.append("1")
         else:
-            per_node = _gpus_per_node_from_alloc(tokens[5:], jobid)
+            per_node = _gpus_per_node_from_alloc([job[c] for c in columns[5:]], jobid)
             # A CPU-only job (e.g. on the dedicated nodes) holds no GPU to count
             if not per_node:
                 no_gpu_jobs += 1

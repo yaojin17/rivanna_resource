@@ -1,9 +1,10 @@
 import subprocess
 import re
 import itertools
-# Before pandas: importing slurm_gpustat pins the BLAS thread pools, which only
-# takes effect if numpy has not been loaded yet.
-from slurm_gpustat import MONITORED_PARTITIONS, parse_node_names
+# Before pandas: importing slurm_gpustat and app pins the BLAS thread pools,
+# which only takes effect if numpy has not been loaded yet.
+from slurm_gpustat import MONITORED_PARTITIONS, parse_node_names, node_states, is_inaccessible
+from app import _reserved_for_others
 import pandas as pd
 
 def get_node_names(partition_name):
@@ -85,8 +86,22 @@ def main():
             continue
         all_nodes.update(node_names)
 
+    # A drained node or one reserved for another group shows idle GPUs that no job
+    # of ours can get, so leave those out, the same way the web page does.
+    states = node_states(partition=MONITORED_PARTITIONS)
+    reserved = _reserved_for_others()
+    closed = {node: states.get(node, "missing from sinfo") for node in all_nodes
+              if node not in states or is_inaccessible(states[node])}
+    held = {node: reserved[node] for node in all_nodes if node in reserved and node not in closed}
+    if closed:
+        print(f"Skipping {len(closed)} nodes not taking jobs: "
+              + ", ".join(f"{n} ({closed[n]})" for n in sorted(closed)))
+    if held:
+        print(f"Skipping {len(held)} nodes reserved for other groups: "
+              + ", ".join(f"{n} ({held[n]})" for n in sorted(held)))
+
     all_resources = []
-    for node in sorted(all_nodes):
+    for node in sorted(all_nodes - set(closed) - set(held)):
         resources = get_node_resources(node)
         if resources:
             all_resources.append(resources)
