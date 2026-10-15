@@ -51,6 +51,11 @@ INTERACTIVE_CMDS = {"bash", "zsh", "sh"}
 # How hard parse_cmd tries before letting a SLURM query fail, see its docstring.
 SLURM_RETRIES = 3
 SLURM_RETRY_DELAY = 1.0
+# The GPU partitions the monitor covers. squeue's --partition matches the partition
+# a job was submitted to, not the node it runs on, so a partition left out here drops
+# every GPU its jobs hold -- even `gpu` and `interactive`, whose GPU nodes all belong
+# to one of the typed partitions as well.
+MONITORED_PARTITIONS = "gpu,gpu-a100-40,gpu-a100-80,gpu-a40,gpu-a6000,gpu-v100,gpu-b200,gpu-rtxpro6000,gpu-mig,gpu-mig-a100,gpu-mig-rtxpro6000,interactive,interactive-rtx2080,interactive-rtx3090,dedicated"
 
 
 def is_inaccessible(state: str) -> bool:
@@ -809,7 +814,7 @@ def _gpus_per_node_from_alloc(extra_tokens: list, jobid: str) -> int:
 
 
 @beartype
-def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,gpu-b200,gpu-rtxpro6000,interactive-rtx3090,interactive-rtx2080,gpu-h200,gpu-mig,gpu-mig-a100,gpu-mig-rtxpro6000,dedicated") -> dict:
+def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
 
     Args:

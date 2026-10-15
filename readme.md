@@ -63,6 +63,10 @@ python available_resources.py    # only what is free
 
 ## What's new
 
+- **2026-10-15** Running Jobs shows the GPU type each job landed on. GPUs held by jobs
+  sent to the mixed `gpu` and `interactive` partitions are now counted in Resource
+  available, the leaderboard, the queue overview and Estimated Wait's free column;
+  free GPUs were overstated before.
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts

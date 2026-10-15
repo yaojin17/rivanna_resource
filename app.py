@@ -48,6 +48,7 @@ from slurm_gpustat import (
     avail_stats_for_node,
     parse_node_names,
     get_gpu_partitions,
+    MONITORED_PARTITIONS,
 )
 
 # from https://developer.nvidia.com/cuda-gpus
@@ -410,8 +411,6 @@ def _state_badge(state):
         cls = "state-idle"
     return f'<span class="state-badge {cls}">{state}</span>'
 
-
-MONITORED_PARTITIONS = "gpu,gpu-a100-40,gpu-a100-80,gpu-a40,gpu-a6000,gpu-v100,gpu-b200,gpu-rtxpro6000,gpu-mig,gpu-mig-a100,gpu-mig-rtxpro6000,interactive,interactive-rtx2080,interactive-rtx3090,dedicated"
 
 # The accounts offered in the page's account picker; the first one is what the
 # page starts on. Everything account-scoped -- the allocation, priority, queue
@@ -2366,12 +2365,38 @@ def parse_queue_to_table(account=None):
     return "\n".join(out)
 
 
+def _gpu_type_on_nodes(jobid, node_str, inventory):
+    """GPU type a running job holds, read off the nodes it runs on.
+
+    A job sent to a mixed partition such as ``gpu`` without naming a type has no
+    type anywhere in squeue; only the node it landed on tells. ``inventory`` is
+    :func:`parse_all_gpus` output. Returns ``?`` when a node is missing from it,
+    and every type joined with ``/`` when the nodes offer more than one, since
+    the job's own share cannot be told apart then.
+    """
+    nodes = parse_node_names(node_str) if node_str else []
+    if not nodes:
+        print(f"Warning: GPU job {jobid} has no node list; type shown as ?")
+        return "?"
+    types = set()
+    for node in nodes:
+        if node not in inventory:
+            print(f"Warning: GPU job {jobid} runs on {node}, which lists no GPUs; type shown as ?")
+            return "?"
+        types.update(entry["type"] for entry in inventory[node])
+    if len(types) > 1:
+        print(f"Warning: nodes {node_str} of job {jobid} offer several GPU types "
+              f"{sorted(types)}; showing them all")
+    return "/".join(sorted(types, key=_type_rank))
+
+
 def parse_running_to_table(account=None):
     """Running jobs of ``account``, the counterpart of the waiting queue.
 
     TIME is how long the job has run and START_TIME when it started, both as
     squeue reports them. GPUS is what the job holds, read from its allocated
-    TRES. The last line totals the account's jobs and GPUs.
+    TRES, and GPU_TYPE the type of the nodes it runs on (see
+    :func:`_gpu_type_on_nodes`). The last line totals the account's jobs and GPUs.
 
     The account comes from the page's picker and is one of LAB_ACCOUNTS, so it
     carries no shell syntax.
@@ -2395,18 +2420,26 @@ def parse_running_to_table(account=None):
             pos += width
         jobs.append(fields)
 
-    # A running job sits in one partition, so the column is as wide as the
-    # longest name rather than cut short like the waiting queue's.
-    part_width = max(len("PARTITION"), *(len(job[1]) for job in jobs))
-    line = "{:>10} {:>" + str(part_width) + "} {:>8} {:>11} {:>6} {:>5} {:>11}  {}"
-    out = [line.format("JOBID", "PARTITION", "USER", "TIME", "LIMIT", "GPUS",
-                       "START_TIME", "NODELIST")]
-    total_gpus = 0
+    inventory = parse_all_gpus()
+    shown = []
     for jobid, partition, user, used, limit, tres, start, nodes in jobs:
         gpus = _alloc_gpu_count(tres)
+        gpu_type = _gpu_type_on_nodes(jobid, nodes, inventory) if gpus else "-"
+        shown.append((jobid, partition, user, used, limit, gpus, gpu_type, start, nodes))
+
+    # A running job sits in one partition, so the column is as wide as the
+    # longest name rather than cut short like the waiting queue's.
+    part_width = max(len("PARTITION"), *(len(job[1]) for job in shown))
+    type_width = max(len("GPU_TYPE"), *(len(job[6]) for job in shown))
+    line = ("{:>10} {:>" + str(part_width) + "} {:>8} {:>11} {:>6} {:>5} {:>"
+            + str(type_width) + "} {:>11}  {}")
+    out = [line.format("JOBID", "PARTITION", "USER", "TIME", "LIMIT", "GPUS",
+                       "GPU_TYPE", "START_TIME", "NODELIST")]
+    total_gpus = 0
+    for jobid, partition, user, used, limit, gpus, gpu_type, start, nodes in shown:
         total_gpus += gpus
         out.append(line.format(jobid, partition, user, used, _short_limit(limit),
-                               gpus, _short_stamp(start), nodes))
+                               gpus, gpu_type, _short_stamp(start), nodes))
     out.append(f"\n{len(jobs)} running jobs, {total_gpus} GPUs")
     return "\n".join(out)
 

@@ -99,6 +99,10 @@ Your account's running jobs with `squeue`'s own columns: how long each has run, 
 time limit, the GPUs it holds (`0` for CPU-only jobs), when it started and on which
 nodes. The last line totals the account's running jobs and GPUs.
 
+`GPU_TYPE` is the GPU type of the node the job landed on (`-` for CPU-only jobs). A job
+sent to a mixed partition such as `gpu` without naming a type shows only `gpu` under
+`PARTITION`; this column tells you whether it got, say, an A100 or an RTX PRO 6000.
+
 ## Waiting Queue
 
 *Scope: account · Built from `squeue`*
