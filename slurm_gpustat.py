@@ -616,11 +616,16 @@ def _gpus_per_node_from_alloc(num_nodes: str, tres_alloc: str, jobid: str) -> in
 
 
 @beartype
-def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) -> dict:
+def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS,
+              excluded: Optional[dict] = None) -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
 
     Args:
         resources (dict :: None): a summary of cluster resources, organised by node name.
+        excluded: nodes the caller left out of ``resources`` on purpose, mapped to
+            why (e.g. "reserved for dac_ssz"). GPUs held on them are reported as a
+            note giving that reason; any other node missing from ``resources``
+            gets a warning.
 
     Returns:
         (dict): a summary of resources organised by user (and also by node name).
@@ -667,10 +672,25 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS) 
     if no_gpu_jobs:
         print(f"Note: gpu_usage skipped {no_gpu_jobs} running jobs that hold no GPU")
     if off_inventory:
-        nodes = sorted(off_inventory)
-        shown = ", ".join(nodes[:5]) + (f" and {len(nodes) - 5} more" if len(nodes) > 5 else "")
-        print(f"Warning: gpu_usage left out {sum(off_inventory.values())} GPUs held on "
-              f"{len(nodes)} nodes outside the inventory it was given ({shown})")
+        def held(nodes):
+            gpus = sum(off_inventory[n] for n in nodes)
+            names = ", ".join(nodes[:5]) + (f" and {len(nodes) - 5} more" if len(nodes) > 5 else "")
+            return (f"{gpus} GPU{'s' * (gpus != 1)} on {len(nodes)} "
+                    f"node{'s' * (len(nodes) != 1)}"), names
+
+        by_reason = defaultdict(list)
+        for node in sorted(off_inventory):
+            by_reason[(excluded or {}).get(node)].append(node)
+        unexplained = by_reason.pop(None, [])
+        if by_reason:
+            parts = []
+            for reason, nodes in by_reason.items():
+                gpus, names = held(nodes)
+                parts.append(f"{gpus} {reason} ({names})")
+            print("Note: gpu_usage left out GPUs held on nodes not counted here: " + "; ".join(parts))
+        if unexplained:
+            gpus, names = held(unexplained)
+            print(f"Warning: gpu_usage left out {gpus} outside the inventory it was given ({names})")
     return usage
 
 
@@ -747,7 +767,9 @@ def available(
         states = node_states()
     res = {key: val for key, val in resources.items()
            if not is_inaccessible(states.get(key, "down"))}
-    usage = gpu_usage(resources=res)
+    excluded = {node: f"in state {states.get(node, 'missing from sinfo')}"
+                for node in resources if node not in res}
+    usage = gpu_usage(resources=res, excluded=excluded)
     subtract_usage(res, usage)
     by_type = resource_by_type(res)
     total = sum(x["count"] for sublist in by_type.values() for x in sublist)

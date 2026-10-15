@@ -259,7 +259,14 @@ def _gpu_pools():
     }
 
     res_total = copy.deepcopy(res_accessible)
-    usage = gpu_usage(resources=res_accessible)
+    # Why each left-out node is not ours to count, for gpu_usage's note on the GPUs
+    # still held there. A reserved node's state was overwritten above.
+    excluded = {
+        node: f"reserved for {reserved[node]}" if node in reserved
+        else f"in state {states.get(node, 'missing from sinfo')}"
+        for node in res_down
+    }
+    usage = gpu_usage(resources=res_accessible, excluded=excluded)
     subtract_usage(res_accessible, usage)
 
     return {
