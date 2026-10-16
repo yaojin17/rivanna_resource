@@ -30,7 +30,9 @@ power and temperature.
 GPU, CPU and memory of every node, grouped by GPU type, with a state badge (`idle`, `mix`,
 `alloc`, `drng`, `resv`) and who is on it. Offline nodes are dimmed. A state ending in
 `*` (such as `comp*`) means SLURM cannot reach the node and sends it no new work, so
-its GPUs count as offline even when they look free.
+its GPUs count as offline even when they look free. `comp` means a job on the node is
+still cleaning up; SLURM starts nothing there until it is done, which usually takes
+seconds but can take hours, so the node counts as offline meanwhile.
 
 ![Resource available](../screenshots/resource.png)
 

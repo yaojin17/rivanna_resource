@@ -31,13 +31,16 @@ from beartype import beartype
 
 
 # Words in a SLURM node state meaning no job can be sent there: the node is down
-# or draining, or held back (reserved, planned, rebooting, powering up).
+# or draining, or held back (reserved, planned, rebooting, powering up, or still
+# cleaning up after a job). SLURM starts nothing on a comp node until every
+# job on it has finished completing, which normally takes seconds but can
+# take hours: udc-aw37-10 sat in comp for hours with its 8 GPUs free on paper
+# while a job asking for 2 of them waited on Resources.
 DOWN_STATE_KEYWORDS = ("down", "drain", "drng", "inval")
-RESV_STATE_KEYWORDS = ("resv", "plnd", "reboot", "pow_up")
+RESV_STATE_KEYWORDS = ("resv", "plnd", "reboot", "pow_up", "comp")
 INACCESSIBLE_KEYWORDS = DOWN_STATE_KEYWORDS + RESV_STATE_KEYWORDS
 # sinfo ends the state of a node it cannot reach with this, and such a node gets no
-# new work whatever its state: a comp* node can sit for hours, its jobs stuck
-# finishing and its GPUs free on paper.
+# new work whatever its state.
 NOT_RESPONDING = "*"
 # Stands in for the type of a GPU whose gres names none.
 NONAME_GPU = "NONAME_GPU"
