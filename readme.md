@@ -63,37 +63,15 @@ python available_resources.py    # only what is free
 
 ## What's new
 
-- **2026-10-15** Running Jobs shows the GPU type each job landed on. GPUs held by jobs
-  sent to the mixed `gpu` and `interactive` partitions are now counted in Resource
-  available, the leaderboard, the queue overview and Estimated Wait's free column;
-  free GPUs were overstated before. Job node lists are now read from `squeue` in full,
-  so a very long one cannot break those panels, and `available_resources.py` covers
-  every monitored partition and leaves out drained nodes and ones reserved for other
-  groups. Estimated Wait runs its SLURM queries side by side (about twice as fast from
-  cold), `available_resources.py` reads the node table once instead of once per node,
-  and the app no longer needs django or humanize. The panels share one `squeue` read
-  per job state, and Queue Overview, Waiting Queue and Estimated Wait count every task
-  of a pending array however long its task list: squeue cuts the list at 64 bytes, and
-  one array counted 145 of its 433 tasks. `slurm_gpustat.py` drops its unused
-  usage-logging daemon (`--action`). Queue Overview counts only jobs queued for the
-  monitored partitions, `RIVANNA_STANDARD_HOURS` now sets the walltime the form starts
-  with, and the app's warnings reach `app.log` as they happen instead of being lost
-  on restart. The app no longer needs humanfriendly, and `slurm_gpustat.py -p` on a
-  partition without GPUs reports none instead of the whole cluster's. Queue Overview
-  counts jobs that ask for GPUs with `--gpus` or a bare `--gres=gpu`; when `sacct`
-  fails or cannot be started, Estimated Wait leaves only its Typical column blank
-  instead of failing as a whole; *Update All* counts a panel the server could not
-  build as failed; `slurm_gpustat.py`'s accessible and available summaries leave out
-  nodes reserved for other groups, like the page; and the app refuses to start with a
-  malformed name in `RIVANNA_ACCOUNTS`. `slurm_gpustat.py` counts a job's GPUs on the
-  nodes it runs on, whichever partition it was sent to: `-p` no longer warns about
-  GPUs held on other nodes, and GPUs held by jobs from unmonitored partitions such as
-  `bii-gpu` no longer show as available. Estimated Wait assumes a running job with no
-  time limit keeps its share for the whole replay instead of warning on every refresh.
-  A node SLURM cannot reach (a state ending in `*`, such as `comp*`) or still cleaning
-  up after a job (`comp`) counts as offline everywhere, since SLURM starts no job
-  there: two B200 nodes and one RTX PRO 6000 node stuck like that for hours showed 22
-  GPUs as free that no job could get.
+- **2026-10-15** Running Jobs shows the GPU type each job landed on. Free GPUs were
+  overstated and are now counted right on the page and in both terminal tools: GPUs
+  held through the mixed `gpu` and `interactive` partitions count as in use, and nodes
+  reserved for other groups, not responding (`comp*`) or stuck cleaning up after a job
+  (`comp`) count as offline. Queue Overview also counts jobs that ask with `--gpus`,
+  and it, Waiting Queue and Estimated Wait count every task of a long pending array
+  (one had counted 145 of 433). Estimated Wait is about twice as fast from cold and
+  blanks only its Typical column when `sacct` fails. The app no longer needs django,
+  humanize or humanfriendly.
 - **2026-09-30** Waiting Queue ends with a total of pending jobs and requested GPUs,
   and a pending job array's row shows its task range.
 - **2026-09-28** Running Jobs panel for your account. The leaderboard no longer counts

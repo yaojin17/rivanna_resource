@@ -2,7 +2,7 @@ import re
 # Before pandas: importing slurm_gpustat pins the BLAS thread pools, which only
 # takes effect if numpy has not been loaded yet.
 from slurm_gpustat import (
-    MONITORED_PARTITIONS, partition_nodes, node_states, is_inaccessible,
+    MONITORED_PARTITIONS, partition_nodes, node_states, split_by_access,
     reserved_for_others, node_records, parse_gres_gpus, alloc_gpu_count,
     avail_stats_for_node,
 )
@@ -48,21 +48,17 @@ def main():
 
     # A drained node or one reserved for another group shows idle GPUs that no job
     # of ours can get, so leave those out, the same way the web page does.
-    states = node_states(partition=MONITORED_PARTITIONS)
-    reserved = reserved_for_others()
-    closed = {node: states.get(node, "missing from sinfo") for node in all_nodes
-              if node not in states or is_inaccessible(states[node])}
-    held = {node: reserved[node] for node in all_nodes if node in reserved and node not in closed}
+    _, closed, reasons = split_by_access(
+        dict.fromkeys(all_nodes), node_states(partition=MONITORED_PARTITIONS),
+        reserved_for_others(),
+    )
     if closed:
         print(f"Skipping {len(closed)} nodes not taking jobs: "
-              + ", ".join(f"{n} ({closed[n]})" for n in sorted(closed)))
-    if held:
-        print(f"Skipping {len(held)} nodes reserved for other groups: "
-              + ", ".join(f"{n} ({held[n]})" for n in sorted(held)))
+              + ", ".join(f"{n} ({reasons[n]})" for n in sorted(closed)))
 
     records = node_records()
     all_resources = []
-    for node in sorted(all_nodes - set(closed) - set(held)):
+    for node in sorted(all_nodes - set(closed)):
         if node not in records:
             print(f"Warning: no scontrol record for node {node}, skipping")
             continue

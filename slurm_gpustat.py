@@ -13,10 +13,12 @@ import subprocess
 from typing import Optional
 from collections import defaultdict
 
-# Same reason as in app.py: the login node is close to its strict-overcommit
-# limit, and a 40-thread OpenBLAS pool is both useless here and large enough to
-# push allocations over it.  Nothing here uses numpy, but available_resources.py
-# imports this module before pandas so that this runs before numpy is loaded.
+# The login node runs with strict overcommit (vm.overcommit_memory=2) and sits
+# close to its commit limit, so the per-core buffers OpenBLAS reserves on one
+# machine with 40 cores are enough to make allocations fail process-wide.  The
+# monitor only does elementwise integer array work, no BLAS, so pin the pools to
+# a single thread.  Nothing here uses numpy, but app.py and available_resources.py
+# import this module before numpy or pandas so that this runs first.
 for _blas_var in (
     "OPENBLAS_NUM_THREADS",
     "OMP_NUM_THREADS",
@@ -38,7 +40,6 @@ from beartype import beartype
 # while a job asking for 2 of them waited on Resources.
 DOWN_STATE_KEYWORDS = ("down", "drain", "drng", "inval")
 RESV_STATE_KEYWORDS = ("resv", "plnd", "reboot", "pow_up", "comp")
-INACCESSIBLE_KEYWORDS = DOWN_STATE_KEYWORDS + RESV_STATE_KEYWORDS
 # sinfo ends the state of a node it cannot reach with this, and such a node gets no
 # new work whatever its state.
 NOT_RESPONDING = "*"
@@ -83,8 +84,12 @@ def _lab_accounts():
 LAB_ACCOUNTS = _lab_accounts()
 
 
+def is_down(state: str) -> bool:
+    return state.endswith(NOT_RESPONDING) or any(kw in state.lower() for kw in DOWN_STATE_KEYWORDS)
+
+
 def is_inaccessible(state: str) -> bool:
-    return state.endswith(NOT_RESPONDING) or any(kw in state.lower() for kw in INACCESSIBLE_KEYWORDS)
+    return is_down(state) or any(kw in state.lower() for kw in RESV_STATE_KEYWORDS)
 
 
 def split_node_str(node_str):
@@ -161,8 +166,10 @@ def parse_node_names(node_str):
 # a plain expiry would miss when eight panels start together.
 CMD_CACHE_SECONDS = int(os.environ.get("RIVANNA_CMD_CACHE_SECONDS", "10"))
 # sstat readings are subtracted from one another to turn counters into a rate, so
-# two calls a few seconds apart have to be two different readings.
-UNCACHEABLE_COMMANDS = ("sstat",)
+# two calls a few seconds apart have to be two different readings.  sacct is read
+# only by _walltime_efficiency in app.py, which keeps its own result far longer;
+# a cached copy of the raw output, megabytes of it, would only sit in memory.
+UNCACHEABLE_COMMANDS = ("sstat", "sacct")
 
 
 def _cmd_is_cacheable(cmd):
@@ -321,13 +328,22 @@ def squeue_jobs(state: str, partitions: Optional[str] = None,
     those with any of them among the partitions they list. ``account`` keeps
     that account's jobs.
     """
-    jobs = squeue_fields(f"-a -h -t {state}", JOB_FIELDS)
+    jobs = _jobs_in_state(state)
     if partitions:
         wanted = set(partitions.split(","))
         jobs = [job for job in jobs if wanted & set(job["partition"].split(","))]
     if account:
         jobs = [job for job in jobs if job["account"] == account]
-    return jobs
+    # Callers get their own list, as from parse_cmd; the job dicts are shared.
+    return list(jobs)
+
+
+@ttl_cache(CMD_CACHE_SECONDS)
+def _jobs_in_state(state: str) -> list:
+    # Parsed once and shared like the command output: half a dozen panels read
+    # each state on every refresh, and parsing thousands of rows each time was
+    # most of their Python time.
+    return squeue_fields(f"-a -h -t {state}", JOB_FIELDS)
 
 
 _GRES_GPU = re.compile(r"gpu:(?:([^:]*):)?(\d*)(?:\(\S*\))?")
@@ -494,7 +510,7 @@ def format_size(size_in_bytes):
     return f"{formatted_tb} T"
 
 
-@ttl_cache(10)
+@ttl_cache(CMD_CACHE_SECONDS)
 def node_records() -> dict:
     """``{node: {key: value}}`` for every node, from a single `scontrol show node`.
 
@@ -690,8 +706,8 @@ def gpu_usage(resources: dict, partition: Optional[str] = MONITORED_PARTITIONS,
                 continue
         num_bash_gpus = num_gpus * (job["batchflag"] == "0")
         for node_name in parse_node_names(job["nodelist"]):
-            # If a node still has jobs running but is draining, it will not be present
-            # in the "available" resources, so we ignore it
+            # A node the caller left out (closed, or outside its partitions) still
+            # has jobs on it; their GPUs are tallied and reported below.
             if node_name not in resources:
                 off_inventory[node_name] += num_gpus
                 continue

@@ -1,19 +1,4 @@
 import os
-
-# The login node runs with strict overcommit (vm.overcommit_memory=2) and sits
-# close to its commit limit, so the per-core buffers OpenBLAS reserves on one
-# machine with 40 cores are enough to make allocations fail process-wide.  This
-# app only does elementwise integer array work, no BLAS, so pin the pools to a
-# single thread; it must happen before numpy is imported to take effect.
-for _blas_var in (
-    "OPENBLAS_NUM_THREADS",
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-):
-    os.environ.setdefault(_blas_var, "1")
-
 import re
 from datetime import datetime, timedelta
 import argparse
@@ -26,31 +11,17 @@ import threading
 import bisect
 import copy
 import time
-import numpy as np
-import pytz
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from html import escape
-from subprocess import (
-    PIPE,
-    STDOUT,
-    CalledProcessError,
-    TimeoutExpired,
-    check_output,
-    run,
-)
-from flask import Flask, Response, render_template_string, request
+# Before numpy: importing slurm_gpustat pins the BLAS thread pools, which only
+# takes effect if numpy has not been loaded yet.
 from slurm_gpustat import (
     resource_by_type,
     parse_all_gpus,
     gpu_usage,
     node_states,
+    is_down,
     is_inaccessible,
     split_by_access,
     partition_nodes,
-    DOWN_STATE_KEYWORDS,
-    RESV_STATE_KEYWORDS,
-    NOT_RESPONDING,
     NONAME_GPU,
     parse_cmd,
     avail_stats_for_node,
@@ -70,6 +41,20 @@ from slurm_gpustat import (
     MONITORED_PARTITIONS,
     LAB_ACCOUNTS,
 )
+import numpy as np
+import pytz
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from html import escape
+from subprocess import (
+    PIPE,
+    STDOUT,
+    CalledProcessError,
+    TimeoutExpired,
+    check_output,
+    run,
+)
+from flask import Flask, Response, render_template_string, request
 
 # Every GPU type the page knows: its compute capability
 # (https://developer.nvidia.com/cuda-gpus), which orders types most capable first,
@@ -194,9 +179,9 @@ def parse_leaderboard():
 def _state_badge(state):
     """Return an HTML badge for the node state."""
     s = state.lower()
-    if s.endswith(NOT_RESPONDING) or any(kw in s for kw in DOWN_STATE_KEYWORDS):
+    if is_down(state):
         cls = "state-down"
-    elif any(kw in s for kw in RESV_STATE_KEYWORDS + ("plan",)):
+    elif is_inaccessible(state):
         cls = "state-resv"
     elif "mix" in s or "alloc" in s:
         cls = "state-busy"
@@ -336,12 +321,8 @@ def parse_usage_to_table():
 
             for node in down_node_names:
                 node_state = states.get(node, "unknown")
-                state_html = f"<td>{_state_badge(node_state)}</td>"
-                if node in reserved:
-                    state_html = (
-                        f"<td>{_state_badge(node_state)} "
-                        f'<span class="queue-muted">{reserved[node]}</span></td>'
-                    )
+                held_by = f' <span class="queue-muted">{reserved[node]}</span>' if node in reserved else ""
+                state_html = f"<td>{_state_badge(node_state)}{held_by}</td>"
                 node_name_td = f"<td>{node}</td>"
                 node_gpu_count = sum(x["count"] for x in res_down[node])
                 down_summaries.append(
@@ -379,10 +360,7 @@ def parse_usage_to_table():
     if mig_type_list:
         mig_bar = get_resource_bar(mig_avail, mig_total)
         mig_down_note = _down_note(mig_down)
-        table_html += (
-            f'<details class="mig-details"><summary>MIG: {mig_bar} slices available{mig_down_note}</summary>'
-            f"<table>{mig_rows}</table></details>"
-        )
+        table_html += _folded(f"MIG: {mig_bar} slices available{mig_down_note}", mig_rows)
 
     return table_html
 
@@ -450,17 +428,12 @@ def get_partition_gpu_types():
     against come from them, so a job queued elsewhere (bii-gpu) is not demand
     for those GPUs.
     """
-    rows = parse_cmd(f"sinfo -h -p {MONITORED_PARTITIONS} -o '%P|%G'")
-    partition_types = defaultdict(set)
-    for row in rows:
-        tokens = row.split("|")
-        if len(tokens) < 2:
-            print(f"Warning: unexpected sinfo row {row!r}, skipping")
-            continue
-        # sinfo marks the default partition with a trailing '*'
-        partition = tokens[0].strip().rstrip("*")
-        for gpu_type, _ in parse_gres_gpus(tokens[1]):
-            partition_types[partition].add(gpu_type or NONAME_GPU)
+    gpus = parse_all_gpus(partition=MONITORED_PARTITIONS)
+    partition_types = {}
+    for partition, nodes in partition_nodes().items():
+        types = {entry["type"] for node in nodes for entry in gpus.get(node, ())}
+        if types:
+            partition_types[partition] = types
     return partition_types
 
 
@@ -506,21 +479,20 @@ def parse_queue_stats_to_table():
             no_gpu_request += 1
             continue
 
-        req_type = _gres_gpu_type(job["tres-per-node"], job["tres-per-job"], job["tres-per-task"])
+        req_type = _gres_gpu_type(job)
         # A pending array's tasks share one row, e.g. tasks 0-5,8%2
         tasks = job["arraytaskid"]
         num_tasks = _array_task_count(tasks)
         total_gpus = job_gpus * num_tasks
 
+        group_key = ", ".join(sorted(gpu_parts))
         candidates = set().union(*(partition_types[p] for p in gpu_parts))
         if req_type:
-            narrowed = {t for t in candidates if t == req_type}
-            if not narrowed:
+            if req_type not in candidates:
                 # The named type is offered by none of the requested partitions; keep
                 # the request visible instead of silently dropping the job.
-                impossible_requests.add((", ".join(sorted(gpu_parts)), req_type))
-                narrowed = {req_type}
-            candidates = narrowed
+                impossible_requests.add((group_key, req_type))
+            candidates = {req_type}
 
         category = _classify_pending_reason(job["reason"])
         totals[category]["jobs"] += num_tasks
@@ -531,7 +503,6 @@ def parse_queue_stats_to_table():
             target[gpu_type][category]["jobs"] += num_tasks
             target[gpu_type][category]["gpus"] += total_gpus
 
-        group_key = ", ".join(sorted(gpu_parts))
         group_stats[group_key]["jobs"] += num_tasks
         group_stats[group_key]["gpus"] += total_gpus
         group_stats[group_key]["types"][req_type if req_type else "any"] += total_gpus
@@ -639,10 +610,7 @@ def parse_queue_stats_to_table():
     )
 
     if mig_type_list:
-        table_html += (
-            '<details class="mig-details"><summary>MIG slices</summary>'
-            f"<table>{header}{_render_type_rows(mig_type_list)}</table></details>"
-        )
+        table_html += _folded("MIG slices", header + _render_type_rows(mig_type_list))
 
     groups = sorted(group_stats.items(), key=lambda x: x[1]["gpus"], reverse=True)
     group_rows = ""
@@ -653,20 +621,15 @@ def parse_queue_stats_to_table():
                 type_parts.append(f'<span class="gpu-type-any">{gpu_type}&times;{count}</span>')
             else:
                 type_parts.append(f"{gpu_type}&times;{count}")
-        group_rows += (
-            f"<tr><td>{group}</td><td>{data['jobs']}</td><td>{data['gpus']}</td>"
-            f"<td>{', '.join(type_parts)}</td></tr>"
-        )
+        group_rows += _table_row([group, data["jobs"], data["gpus"], ", ".join(type_parts)])
     all_jobs = sum(v["jobs"] for v in totals.values())
     all_gpus = sum(v["gpus"] for v in totals.values())
-    table_html += (
-        '<details class="mig-details"><summary>Raw breakdown by requested partitions'
-        f" ({all_jobs} jobs, {all_gpus} gpus)</summary><table>"
-        "<tr><th>Partition(s)</th><th>Pending Jobs</th><th>GPUs Needed</th>"
-        "<th>Requested GPU Type</th></tr>"
-        f"{group_rows}"
-        f'<tr class="queue-stats-total"><td><b>Total</b></td><td><b>{all_jobs}</b></td>'
-        f"<td><b>{all_gpus}</b></td><td></td></tr></table></details>"
+    table_html += _folded(
+        f"Raw breakdown by requested partitions ({all_jobs} jobs, {all_gpus} gpus)",
+        _table_row(["Partition(s)", "Pending Jobs", "GPUs Needed", "Requested GPU Type"], "th")
+        + group_rows
+        + f'<tr class="queue-stats-total"><td><b>Total</b></td><td><b>{all_jobs}</b></td>'
+        f"<td><b>{all_gpus}</b></td><td></td></tr>",
     )
 
     return table_html
@@ -715,7 +678,7 @@ _reported_no_access_guard = threading.Lock()
 TEST_ONLY_CACHE_SECONDS = int(os.environ.get("RIVANNA_TEST_ONLY_TTL", "60"))
 # Threads the wait estimate runs its SLURM reads and test-only checks on.
 WAIT_ESTIMATE_WORKERS = 4
-# Union partitions already reported as skipped, for the same reason.
+# Union partitions already reported as skipped, so that log is not repeated either.
 _reported_unions = set()
 
 
@@ -951,10 +914,10 @@ PLAN_MINUTES = 10
 PLAN_HORIZON_DAYS = 30
 
 
-def _gres_gpu_type(*tres_strings):
-    """GPU type named in any of the tres-per-* strings, or None when untyped."""
-    for text in tres_strings:
-        match = re.search(r"gpu:([^:,()]+):\d+", text)
+def _gres_gpu_type(job):
+    """GPU type an squeue row names in any of its tres-per-* fields, or None."""
+    for field in ("tres-per-node", "tres-per-job", "tres-per-task"):
+        match = re.search(r"gpu:([^:,()]+):\d+", job[field])
         if match:
             return match.group(1)
     return None
@@ -1113,20 +1076,26 @@ def _row_alloc(row, max_minutes, what):
     }
 
 
-def _running_jobs_by_node(rows, now, max_minutes):
+def _running_jobs_by_node(rows, now, max_minutes, wanted):
     """node -> list of running allocations on it, from squeue rows.
 
     Each allocation carries what the job holds on *that* node (a multi-node job
     is split evenly), when SLURM will kill it, and how much of its limit it has
     already used so the Typical estimate can shorten it. A job with no time
-    limit has no end (None): nothing says when it lets go of its share.
+    limit has no end (None): nothing says when it lets go of its share. Only
+    jobs on a node in ``wanted`` are read: the rest of the cluster's thousands
+    take most of the time and none of the pools.
     """
     by_node = defaultdict(list)
     no_limit = []
+    elsewhere = 0
     for row in rows:
         nodes = parse_node_names(row["nodelist"]) if row["nodelist"] else []
         if not nodes:
             print(f"Warning: running job {row['jobid']} has no node list, skipping")
+            continue
+        if wanted.isdisjoint(nodes):
+            elsewhere += 1
             continue
         n_nodes = len(nodes)
         held = _row_alloc(row, max_minutes, "job")
@@ -1148,13 +1117,16 @@ def _running_jobs_by_node(rows, now, max_minutes):
             "gpus": held["gpus"] // n_nodes,
             "cpus": held["cpus"] // n_nodes,
             "mem_mb": held["mem_mb"] // n_nodes,
-            "gpu_type": _gres_gpu_type(row["tres-per-node"], row["tres-per-job"], row["tres-per-task"]),
+            "gpu_type": _gres_gpu_type(row),
             "end": end,
             "limit": limit,
             "array": held["array"],
         }
         for node in nodes:
             by_node[node].append(alloc)
+    if elsewhere:
+        print(f"Note: the wait replay left out {elsewhere} running jobs on nodes outside "
+              "the monitored partitions")
     if no_limit:
         print(f"Note: running jobs with no time limit ({', '.join(no_limit)}) keep what they "
               f"hold for all {PLAN_HORIZON_DAYS} days of the wait replay")
@@ -1182,7 +1154,7 @@ def _competing_jobs(rows, priorities, partitions, score, gpu_type, node_gpus, ma
             # Capped by a per-user/QOS limit: it starts when its owner's other
             # jobs end, which nothing here can predict.
             continue
-        wanted_type = _gres_gpu_type(row["tres-per-node"], row["tres-per-job"], row["tres-per-task"])
+        wanted_type = _gres_gpu_type(row)
         if wanted_type and wanted_type != gpu_type:
             continue
         n_nodes = _first_int(row["numnodes"]) or 1
@@ -1511,7 +1483,6 @@ def parse_wait_estimate_to_table(job):
             print(f"Warning: sacct failed ({exc}); the Typical column will be blank")
             efficiency = {}
     pools = read["pools"]
-    states = pools["states"]
     total_by_node = pools["total_by_node"]
     free_by_node = pools["free_by_node"]
     part_nodes = read["partition_nodes"]
@@ -1522,7 +1493,9 @@ def parse_wait_estimate_to_table(job):
     default_limit = max(
         (l["max_minutes"] for l in limits.values() if l["max_minutes"]), default=3 * 24 * 60
     )
-    running_by_node = _running_jobs_by_node(read["running"], now, default_limit)
+    running_by_node = _running_jobs_by_node(
+        read["running"], now, default_limit, set().union(*part_nodes.values())
+    )
     pending_rows = read["pending"]
 
     def _count(by_node, partition, gpu_type):
@@ -1545,11 +1518,10 @@ def parse_wait_estimate_to_table(job):
                 unavailable.append((spec, failure[1]))
             continue
 
-        # The pool: reachable nodes of this partition carrying this GPU type.
+        # The pool: reachable nodes of this partition carrying this GPU type;
+        # total_by_node holds only the nodes split_by_access left open.
         nodes = {}
         for node in part_nodes.get(partition, ()):
-            if is_inaccessible(states.get(node, "down")):
-                continue
             gpus = sum(e["count"] for e in total_by_node.get(node, ()) if e["type"] == gpu_type)
             if not gpus:
                 continue
@@ -1709,10 +1681,7 @@ def parse_wait_estimate_to_table(job):
         "reason.</p>"
     )
     if mig_rows:
-        table_html += (
-            '<details class="mig-details"><summary>MIG slices</summary>'
-            f"<table>{header}{_render_rows(mig_rows)}</table></details>"
-        )
+        table_html += _folded("MIG slices", header + _render_rows(mig_rows))
     if unavailable:
         # These failed on the job shape the form asked for, so the reason is
         # actionable: shrink the request, or accept that the pool cannot host it.
@@ -1721,11 +1690,9 @@ def parse_wait_estimate_to_table(job):
             f"<td class='queue-muted'>{error}</td></tr>"
             for spec, error in unavailable
         )
-        table_html += (
-            '<details class="mig-details"><summary>Pools this job shape does not fit '
-            f"({len(unavailable)})</summary><table>"
-            "<tr><th>GPU Type</th><th>Partition</th><th>Reason</th></tr>"
-            f"{rows_html}</table></details>"
+        table_html += _folded(
+            f"Pools this job shape does not fit ({len(unavailable)})",
+            _table_row(["GPU Type", "Partition", "Reason"], "th") + rows_html,
         )
     if no_access:
         # "Invalid account" is a statement about the account, not the pool, and
@@ -2062,6 +2029,11 @@ def parse_running_to_table(account):
 def _table_row(cells, tag="td"):
     """One HTML table row with a ``tag`` cell per entry of ``cells``."""
     return "<tr>" + "".join(f"<{tag}>{cell}</{tag}>" for cell in cells) + "</tr>"
+
+
+def _folded(summary, rows):
+    """A table folded away under a clickable ``summary`` line."""
+    return f'<details class="mig-details"><summary>{summary}</summary><table>{rows}</table></details>'
 
 
 @ttl_cache(CMD_CACHE_SECONDS)
@@ -2652,10 +2624,11 @@ def parse_my_jobs_to_table():
 
     Two sources are combined per refresh.  One sstat call covers every job at
     once and gives the CPU time and resident memory the accounting plugin last
-    sampled; then one short nvidia-smi step per GPU job gives the readings SLURM
-    does not keep, above all the power draw and the board temperature.  A job
-    whose probe fails still shows the GPU utilisation and memory that sstat
-    collected, marked as coming from accounting rather than from the card.
+    sampled; then one short gpu_probe.py step per GPU job (nvidia-smi where that
+    fails) gives the readings SLURM does not keep, above all the power draw and
+    the board temperature.  A job whose probe fails still shows the GPU
+    utilisation and memory that sstat collected, marked as coming from
+    accounting rather than from the card.
     """
     owner = _app_owner()
     jobs = _my_running_jobs()
