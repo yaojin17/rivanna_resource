@@ -288,19 +288,20 @@ def squeue_fields(args: str, fields) -> list:
 
     Given a width, squeue -O cuts a field to it without a word, and a node list cut
     inside its brackets cannot be parsed. So every field is asked for in full
-    (width 0) and closed with ``|``. Only the last field may itself contain a
-    ``|``, so free text such as a job name or pending reason goes last; a row
+    (width 0) and closed with a tab. Feature constraints contain ``|``, so
+    a pipe cannot delimit these records. Free text goes last; a row
     that still does not split into ``fields`` is skipped with a warning.
 
     A pending array's task list is cut to 64 bytes and ended with ``...``
     whatever the width, unless SLURM_BITSTR_LEN is 0; cut, it hid 288 of the
     433 tasks of one array.
     """
-    fmt = ",".join(f"{name}:0|" for name in fields)
+    separator = "\t"
+    fmt = ",".join(f"{name}:0{separator}" for name in fields)
     entries = []
     for row in parse_cmd(f"SLURM_BITSTR_LEN=0 squeue {args} -O '{fmt}'"):
-        values = row.rstrip().removesuffix("|").split("|", len(fields) - 1)
-        if len(values) != len(fields) or not row.rstrip().endswith("|"):
+        values = row.removesuffix(separator).split(separator, len(fields) - 1)
+        if len(values) != len(fields) or not row.endswith(separator):
             print(f"Warning: squeue row does not split into {len(fields)} fields: "
                   f"{row[:120]!r}, skipping")
             continue
@@ -316,7 +317,7 @@ JOB_FIELDS = (
     "jobid", "arrayjobid", "arraytaskid", "prioritylong", "partition", "account",
     "username", "state", "batchflag", "submittime", "starttime", "endtime", "timeused",
     "timelimit", "nodelist", "numnodes", "tres-per-node", "tres-per-job",
-    "tres-per-task", "tres-alloc", "reason",
+    "tres-per-task", "tres-alloc", "feature", "reqnodes", "excnodes", "reason",
 )
 
 

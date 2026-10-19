@@ -107,7 +107,7 @@ Environment variables, read when `app.py` starts.
 | --- | --- | --- |
 | `RIVANNA_ACCOUNTS` | `uva_cv_lab,cang-lab-in-silico` | Accounts in the header picker, comma separated. First one is the default. Only letters, digits, `_`, `.` and `-`; the app will not start with anything else. |
 | `RIVANNA_STANDARD_HOURS` | `24` | Walltime the wait-estimate form starts with and resets to. The browser keeps the walltime of your last estimate until you press Reset. |
-| `RIVANNA_WALLTIME_DAYS` | `3` | Days of finished jobs used for the `Typical` wait. |
+| `RIVANNA_WALLTIME_DAYS` | `3` | Days of finished jobs used for the `Historical Runtime` wait. |
 | `RIVANNA_WALLTIME_TTL` | `1800` | Seconds before that sample is refreshed. |
 | `RIVANNA_TEST_ONLY_TTL` | `60` | Seconds an `sbatch --test-only` verdict is kept. |
 | `RIVANNA_CMD_CACHE_SECONDS` | `10` | Seconds identical SLURM queries, and `hdquota`, are shared between panels. `0` turns it off. |

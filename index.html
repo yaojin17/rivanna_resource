@@ -102,8 +102,8 @@
         <label>GPUs <input type="text" id="jobGpus" value="1" size="4"></label>
         <label>CPUs <input type="text" id="jobCpus" value="auto" size="5"
             title="Total CPUs for the job. 'auto' = this GPU's even share of the node."></label>
-        <label>Mem (GB) <input type="text" id="jobMem" value="auto" size="5"
-            title="Total memory for the job. 'auto' = this GPU's even share of the node."></label>
+        <label>Mem (GiB) <input type="text" id="jobMem" value="auto" size="5"
+            title="Memory in GiB, matching sbatch --mem=NG. 'auto' = this GPU's even share of the node."></label>
         <label>Walltime (h) <input type="text" id="jobHours" value="{{ standard_hours }}" size="4"></label>
         <button type="submit" id="jobButton">Recalculate</button>
         <button type="button" onclick="resetJobForm()">Reset</button>

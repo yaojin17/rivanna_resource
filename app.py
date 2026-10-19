@@ -25,6 +25,7 @@ from slurm_gpustat import (
     NONAME_GPU,
     parse_cmd,
     avail_stats_for_node,
+    node_records,
     parse_node_names,
     squeue_fields,
     squeue_jobs,
@@ -356,6 +357,11 @@ def parse_usage_to_table():
     total_summary = f'<tr><td colspan="7"><h3>Summary: {total_bar} gpus available{down_note}</h3></td></tr>'
 
     table_html = f"<table>{total_summary}{gpu_rows}</table>"
+    table_html += (
+        '<p class="queue-note">Available means unallocated in Slurm. A job also needs '
+        "enough CPUs and memory on the same node, plus a scheduling window for its "
+        "walltime. These counts alone do not mean it can start now.</p>"
+    )
 
     if mig_type_list:
         mig_bar = get_resource_bar(mig_avail, mig_total)
@@ -421,20 +427,92 @@ def _classify_pending_reason(reason):
     return "blocked"
 
 
-def get_partition_gpu_types():
-    """Map every monitored partition to the set of GPU types its nodes provide.
+# What squeue prints for a job with no node list or constraint.
+UNSET_JOB_FIELD = ("", "(null)", "N/A")
+# The --constraint syntax read here: features joined by & (and) or | (or). Matching-OR
+# brackets around the whole expression are dropped, since for whether one node
+# qualifies they are a plain or. Brackets inside it (a100&[a40|a6000]), counts
+# (a100*2), parentheses and negation are not read, and leave the job free to use
+# any node.
+SIMPLE_CONSTRAINT = re.compile(r"[\w.-]+(?:[&|][\w.-]+)*")
+MATCHING_OR = re.compile(r"\[([^\[\]]+)\]")
 
-    Only MONITORED_PARTITIONS: the GPU counts Queue Overview weighs demand
-    against come from them, so a job queued elsewhere (bii-gpu) is not demand
-    for those GPUs.
+
+class _NodeEligibility:
+    """Which nodes a pending job may use, from its -w, -x and --constraint.
+
+    Built once per panel refresh from ``members`` (partition -> nodes): node
+    features come from one scontrol table, and each distinct constraint, and each
+    distinct request, a few dozen against thousands of jobs, is worked out once. A
+    node with no scontrol record (the table could not be read) counts as having
+    every feature, so a failed read leaves jobs unfiltered rather than turning them
+    all away.
     """
-    gpus = parse_all_gpus(partition=MONITORED_PARTITIONS)
-    partition_types = {}
-    for partition, nodes in partition_nodes().items():
-        types = {entry["type"] for node in nodes for entry in gpus.get(node, ())}
-        if types:
-            partition_types[partition] = types
-    return partition_types
+
+    def __init__(self, records, members):
+        self.members = members
+        self.nodes = set().union(*members.values())
+        self.features = {
+            node: set(records[node].get("ActiveFeatures", "").split(","))
+            for node in self.nodes if node in records
+        }
+        missing = len(self.nodes) - len(self.features)
+        if missing:
+            print(f"Warning: no scontrol record for {missing} of {len(self.nodes)} nodes, "
+                  "so job constraints cannot rule them out")
+        self.by_constraint = {}
+        self.by_request = {}
+        self.unread = set()
+
+    def _matching(self, expression):
+        """Nodes satisfying ``expression``, every node when it cannot be read."""
+        if expression not in self.by_constraint:
+            wrapped = MATCHING_OR.fullmatch(expression)
+            simple = wrapped.group(1) if wrapped else expression
+            if SIMPLE_CONSTRAINT.fullmatch(simple):
+                alternatives = [set(option.split("&")) for option in simple.split("|")]
+                self.by_constraint[expression] = {
+                    node for node in self.nodes
+                    if node not in self.features
+                    or any(option <= self.features[node] for option in alternatives)
+                }
+            else:
+                self.unread.add(expression)
+                self.by_constraint[expression] = self.nodes
+        return self.by_constraint[expression]
+
+    def job_nodes(self, job, partitions):
+        """The nodes of ``partitions`` that ``job`` may run on, as a frozenset shared
+        with every job that asks the same way."""
+        key = (tuple(partitions), job["excnodes"], job["feature"], job["reqnodes"],
+               job["numnodes"])
+        if key not in self.by_request:
+            self.by_request[key] = frozenset(self._eligible(*key))
+        return self.by_request[key]
+
+    def _eligible(self, partitions, excluded, expression, required, numnodes):
+        candidates = set().union(*(self.members.get(p, ()) for p in partitions))
+        if excluded not in UNSET_JOB_FIELD:
+            candidates -= set(parse_node_names(excluded))
+        if expression not in UNSET_JOB_FIELD:
+            candidates &= self._matching(expression)
+        if required not in UNSET_JOB_FIELD:
+            # -w names nodes the job must all get, not a choice among them: if one is
+            # unusable here, so is the job. With more nodes asked for than listed it
+            # also takes others, and those may be any candidate; the wait replay
+            # does not force the listed ones into its pick (no live job does this).
+            required = set(parse_node_names(required))
+            if not required <= candidates:
+                return set()
+            if len(required) >= (_first_int(numnodes) or 1):
+                return required
+        return candidates
+
+    def report(self, panel):
+        """Say once which constraints were not read, rather than once per job."""
+        if self.unread:
+            print(f"Warning: {panel} could not read {len(self.unread)} job constraints and "
+                  f"let those jobs use any node: {', '.join(sorted(self.unread))}")
 
 
 def parse_queue_stats_to_table():
@@ -442,13 +520,26 @@ def parse_queue_stats_to_table():
     they are actually waiting for.
 
     A pending job may list several partitions and may not name a GPU type at all, so
-    the types it can land on are derived from the partitions it requested. Jobs left
+    the types it can land on are those of the nodes in its partitions that its -w, -x
+    and --constraint leave it; a job left none counts as blocked. Jobs left
     with a single candidate type are committed demand for that type; jobs with several
     candidates are reported separately, because they will only ever consume one of
     them. Jobs are also split by their pending reason, so that the queue depth that
     actually competes for GPUs is not drowned out by jobs held back by dependencies.
     """
-    partition_types = get_partition_gpu_types()
+    # Only MONITORED_PARTITIONS: the GPU counts demand is weighed against come from
+    # them, so a job queued elsewhere (bii-gpu) is not demand for those GPUs.
+    members = partition_nodes()
+    inventory = parse_all_gpus(partition=MONITORED_PARTITIONS)
+
+    @functools.cache
+    def _types_on(nodes):
+        """GPU types on a frozenset of nodes; jobs asking alike share one set."""
+        return frozenset(entry["type"] for node in nodes for entry in inventory.get(node, ()))
+
+    partition_types = {p: types for p, nodes in members.items()
+                       if (types := _types_on(frozenset(nodes)))}
+    eligibility = _NodeEligibility(node_records(), members)
 
     def _new_bucket():
         return {category: {"jobs": 0, "gpus": 0} for category in QUEUE_CATEGORIES}
@@ -464,8 +555,7 @@ def parse_queue_stats_to_table():
 
     for job in squeue_jobs("PENDING"):
         partition_list = [p.strip() for p in job["partition"].split(",")]
-        # The monitored partitions whose nodes have GPUs, so every partition kept
-        # here contributes at least one candidate type below.
+        # The monitored partitions whose nodes have GPUs.
         gpu_parts = [p for p in partition_list if p in partition_types]
         if not gpu_parts:
             not_gpu_partition += 1
@@ -486,15 +576,20 @@ def parse_queue_stats_to_table():
         total_gpus = job_gpus * num_tasks
 
         group_key = ", ".join(sorted(gpu_parts))
-        candidates = set().union(*(partition_types[p] for p in gpu_parts))
+        candidates = _types_on(eligibility.job_nodes(job, gpu_parts))
         if req_type:
-            if req_type not in candidates:
+            if not any(req_type in partition_types[p] for p in gpu_parts):
                 # The named type is offered by none of the requested partitions; keep
                 # the request visible instead of silently dropping the job.
                 impossible_requests.add((group_key, req_type))
+            # Its node lists or constraint may rule out every node of that type even
+            # where the partitions offer it; either way it can never start.
+            runnable = req_type in candidates
             candidates = {req_type}
+        else:
+            runnable = bool(candidates)
 
-        category = _classify_pending_reason(job["reason"])
+        category = _classify_pending_reason(job["reason"]) if runnable else "blocked"
         totals[category]["jobs"] += num_tasks
         totals[category]["gpus"] += total_gpus
 
@@ -510,6 +605,7 @@ def parse_queue_stats_to_table():
     if not_gpu_partition or no_gpu_request:
         print(f"Note: queue overview skipped {not_gpu_partition} pending jobs outside the "
               f"monitored GPU partitions and {no_gpu_request} that ask for no GPU")
+    eligibility.report("queue overview")
     for group, req_type in sorted(impossible_requests):
         print(
             f"Warning: pending jobs ask for gpu type {req_type!r} in partition(s) "
@@ -552,8 +648,8 @@ def parse_queue_stats_to_table():
             waiting_gpus = own["waiting"]["gpus"]
             flex_jobs = flex["waiting"]["jobs"]
             flex_gpus = flex["waiting"]["gpus"]
-            throttled_gpus = own["throttled"]["gpus"]
-            blocked_gpus = own["blocked"]["gpus"]
+            throttled_gpus = own["throttled"]["gpus"] + flex["throttled"]["gpus"]
+            blocked_gpus = own["blocked"]["gpus"] + flex["blocked"]["gpus"]
 
             if flex_gpus:
                 flex_cell = (
@@ -597,7 +693,7 @@ def parse_queue_stats_to_table():
         f'{totals["waiting"]["jobs"]} jobs / {totals["waiting"]["gpus"]} gpus'
         f'<span class="queue-muted"> &nbsp;|&nbsp; throttled by QOS/array limits: '
         f'{totals["throttled"]["jobs"]} jobs / {totals["throttled"]["gpus"]} gpus '
-        f"&nbsp;|&nbsp; blocked by dependencies or holds: "
+        f"&nbsp;|&nbsp; blocked by dependencies, holds or no usable node: "
         f'{totals["blocked"]["jobs"]} jobs / {totals["blocked"]["gpus"]} gpus</span>'
         "</h3></td></tr>"
     )
@@ -605,7 +701,7 @@ def parse_queue_stats_to_table():
     table_html = f"<table>{summary}{header}{_render_type_rows(gpu_type_list)}</table>"
     table_html += (
         '<p class="queue-note">A job that names several partitions is counted under '
-        "every GPU type it could land on, so the <b>Flexible</b> column overlaps between "
+        "every GPU type it could land on, so <b>Flexible</b> and <b>Not Competing</b> overlap between "
         "rows; only the summary line above is a plain per-job total.</p>"
     )
 
@@ -824,9 +920,9 @@ def _standard_job_specs(job):
             else:
                 job_cpus = job["cpus"]
             if job["mem_gb"] is None:
-                job_mem = max(mem // n_gpu, 1000) * job["gpus"]
+                job_mem = max(mem // n_gpu, 1024) * job["gpus"]
             else:
-                job_mem = job["mem_gb"] * 1000
+                job_mem = job["mem_gb"] * 1024
 
             max_mem_per_cpu = limit.get("max_mem_per_cpu")
             if max_mem_per_cpu and job_mem > max_mem_per_cpu * job_cpus:
@@ -854,13 +950,8 @@ def _standard_job_specs(job):
 def _test_only_check(spec, account):
     """Ask SLURM whether this job shape is admissible for ``account`` in this pool.
 
-    Only the verdict is used. The start time sbatch prints is discarded on
-    purpose: slurmctld derives it (``_delayed_job_start_time``) by adding up the
-    CPU-time of every pending job in the partition whose priority number is at
-    least ours, *including* jobs held by a dependency, and spreading that over
-    the partition. In a busy pool that adds weeks to a queue that is really a
-    few days long, which is why :func:`_plan_pool` estimates the start
-    instead. Returns None when the job is admissible, else a
+    Only the admission verdict is used; the separate replay produces an
+    approximate start under its stated assumptions. Returns None when the job is admissible, else a
     ``("no_access" | "error", reason)`` tuple.
     """
     return _test_only_verdict(
@@ -1081,7 +1172,7 @@ def _running_jobs_by_node(rows, now, max_minutes, wanted):
 
     Each allocation carries what the job holds on *that* node (a multi-node job
     is split evenly), when SLURM will kill it, and how much of its limit it has
-    already used so the Typical estimate can shorten it. A job with no time
+    already used so the Historical Runtime estimate can shorten it. A job with no time
     limit has no end (None): nothing says when it lets go of its share. Only
     jobs on a node in ``wanted`` are read: the rest of the cluster's thousands
     take most of the time and none of the pools.
@@ -1133,14 +1224,18 @@ def _running_jobs_by_node(rows, now, max_minutes, wanted):
     return by_node
 
 
-def _competing_jobs(rows, priorities, partitions, score, gpu_type, node_gpus, max_minutes):
+def _competing_jobs(rows, priorities, partitions, score, gpu_type, node_gpus, max_minutes,
+                    nodes, eligible_by_job):
     """Pending jobs that outrank ``score`` in any of ``partitions`` and fit this pool.
 
-    ``rows`` are pending squeue rows, ``priorities`` comes from :func:`_sprio_by_job`.
-    Array tasks still folded into their parent record are expanded so each
-    counts once. Returns the list sorted by priority, highest first.
+    ``rows`` are pending squeue rows, ``priorities`` comes from :func:`_sprio_by_job`,
+    ``eligible_by_job`` holds the nodes each row may use anywhere. Array tasks still
+    folded into their parent record are expanded so each counts once. Returns the
+    list sorted by priority, highest first, and the ids of the jobs that would
+    compete but whose node lists or constraint keep them out of this pool.
     """
     jobs = []
+    ruled_out = set()
     for row in rows:
         ranks = priorities.get(row["jobid"], {})
         prio = max((ranks[p] for p in partitions if p in ranks), default=None)
@@ -1157,7 +1252,11 @@ def _competing_jobs(rows, priorities, partitions, score, gpu_type, node_gpus, ma
         wanted_type = _gres_gpu_type(row)
         if wanted_type and wanted_type != gpu_type:
             continue
+        eligible = eligible_by_job[row["jobid"]] & nodes.keys()
         n_nodes = _first_int(row["numnodes"]) or 1
+        if len(eligible) < n_nodes:
+            ruled_out.add(row["jobid"])
+            continue
         asked = _row_alloc(row, max_minutes, "pending job")
         gpn = -(-asked["gpus"] // n_nodes)
         if gpn > node_gpus:
@@ -1183,10 +1282,11 @@ def _competing_jobs(rows, priorities, partitions, score, gpu_type, node_gpus, ma
             "minutes": asked["minutes"],
             "array": array,
             "throttle": throttle,
+            "eligible_nodes": eligible,
         }
         jobs.extend([job] * count)
     jobs.sort(key=lambda j: (-j["prio"], j["id"]))
-    return jobs
+    return jobs, ruled_out
 
 
 def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
@@ -1197,14 +1297,15 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
     being estimated; it is planned last, as a fresh submission would be. Time is
     cut into PLAN_MINUTES buckets over PLAN_HORIZON_DAYS. Running jobs hold their
     resources until they end; then every queued job, in priority order, takes
-    the earliest window in which enough nodes have its GPUs, CPUs and memory
-    free for its whole time limit, and array tasks also respect their throttle.
+    the earliest window in which enough of its ``eligible_nodes`` have its GPUs,
+    CPUs and memory free for its whole time limit, and array tasks also respect
+    their throttle.
     Lower-priority jobs fill earlier gaps only when they do not touch a window
     already claimed, which is the backfill guarantee.
 
     With ``ratio`` set, every job is assumed to use that fraction of its limit
-    instead of all of it, which is what turns the worst case into the Typical
-    column. Returns None when the job finds no window inside the horizon.
+    instead of all of it, which is what turns Full Limits into the Historical
+    Runtime column. Returns None when the job finds no window inside the horizon.
     """
     names = sorted(nodes)
     index = {name: i for i, name in enumerate(names)}
@@ -1246,6 +1347,7 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
 
     unplaceable = set()
     earliest_by_job = {}
+    allowed_by_job = {}  # id(job) -> which rows of avail it may use, None for all
     for job in list(queue) + [ours]:
         # Expanded array tasks share one job dict. Once one cannot fit, later
         # copies cannot fit either: queued placements only consume resources
@@ -1271,6 +1373,14 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
         first = earliest_by_job.get(id(job), 0)
         limit = min(first + 24 * 60 // PLAN_MINUTES, possible_starts)
         start = None
+        if id(job) not in allowed_by_job:
+            # None when the job may use every node of the pool, most of them do.
+            eligible = job["eligible_nodes"]
+            allowed_by_job[id(job)] = (
+                None if len(eligible) == len(names)
+                else np.array([name in eligible for name in names])[:, None]
+            )
+        allowed = allowed_by_job[id(job)]
         while True:
             end = limit + span - 1
             ok = (
@@ -1278,6 +1388,8 @@ def _plan_pool(nodes, running_by_node, queue, ours, now, ratio=None):
                 & (avail[1, :, first:end] >= job["cpn"])
                 & (avail[2, :, first:end] >= job["mpn"])
             )
+            if allowed is not None:
+                ok &= allowed
             if job["throttle"]:
                 ok &= (use[first:end] < job["throttle"])[None, :]
             # A window fits when it holds no bad bucket.
@@ -1347,12 +1459,13 @@ FINISHED_STATES = (
 def _walltime_efficiency():
     """Measure what fraction of its requested walltime a finished GPU job really uses.
 
-    ``sbatch --test-only`` assumes every job ahead of you runs to its full time
-    limit, which is why its answer is an upper bound. This ratio, measured per
-    partition from the last few days of accounting data, is what turns that bound
-    into a realistic figure. One sacct call covers every monitored partition, and
-    the result is cached because it barely moves between page refreshes. A failed
-    sacct raises, so it is not cached and the next refresh tries again.
+    The Full Limits replay lets every job run to its time limit; the Historical
+    Runtime replay scales jobs by this ratio instead, measured per partition from
+    the last few days of accounting data as elapsed time over time limit, each
+    summed, so long jobs weigh more. One sacct call covers every monitored
+    partition, and the result is cached because it barely moves between page
+    refreshes. A failed sacct raises, so it is not cached and the next refresh
+    tries again.
     """
     cmd = (
         f"sacct -a -X -S now-{WALLTIME_SAMPLE_DAYS}days -r {MONITORED_PARTITIONS} "
@@ -1396,11 +1509,11 @@ def _walltime_efficiency():
         if entry["jobs"] < WALLTIME_MIN_SAMPLE or entry["limit"] == 0:
             print(
                 f"Note: only {entry['jobs']} finished GPU jobs in {partition} over the last "
-                f"{WALLTIME_SAMPLE_DAYS} days, too few for a Typical estimate"
+                f"{WALLTIME_SAMPLE_DAYS} days, too few for a Historical Runtime estimate"
             )
             continue
         # Jobs can overrun slightly into the grace period; a ratio above 1 would
-        # make Typical worse than the upper bound it is scaling.
+        # make Historical Runtime worse than the Full Limits replay it is scaling.
         data[partition] = {
             "ratio": min(entry["elapsed"] / entry["limit"], 1.0),
             "jobs": entry["jobs"],
@@ -1465,9 +1578,11 @@ def parse_wait_estimate_to_table(job):
                 ("priorities", _sprio_by_job),
                 ("running", lambda: squeue_jobs("RUNNING")),
                 ("pending", lambda: squeue_jobs("PENDING", MONITORED_PARTITIONS)),
+                ("records", node_records),
             )
         }
-        scores = _account_score(_account_priority_profile(job["account"]), factors.result())
+        profile = _account_priority_profile(job["account"])
+        scores = _account_score(profile, factors.result())
         if scores is None:
             pool.shutdown(cancel_futures=True)
             return (
@@ -1479,8 +1594,8 @@ def parse_wait_estimate_to_table(job):
         try:
             efficiency = reads["efficiency"].result()
         except (CalledProcessError, OSError) as exc:
-            # Typical only scales the upper bound, which still stands without it.
-            print(f"Warning: sacct failed ({exc}); the Typical column will be blank")
+            # Historical Runtime only scales Full Limits, which still stands without it.
+            print(f"Warning: sacct failed ({exc}); the Historical Runtime column will be blank")
             efficiency = {}
     pools = read["pools"]
     total_by_node = pools["total_by_node"]
@@ -1493,10 +1608,16 @@ def parse_wait_estimate_to_table(job):
     default_limit = max(
         (l["max_minutes"] for l in limits.values() if l["max_minutes"]), default=3 * 24 * 60
     )
-    running_by_node = _running_jobs_by_node(
-        read["running"], now, default_limit, set().union(*part_nodes.values())
-    )
+    eligibility = _NodeEligibility(read["records"], part_nodes)
+    running_by_node = _running_jobs_by_node(read["running"], now, default_limit, eligibility.nodes)
     pending_rows = read["pending"]
+    # Where each pending job may run at all, worked out once for every pool below.
+    eligible_by_job = {
+        row["jobid"]: eligibility.job_nodes(row, row["partition"].split(","))
+        for row in pending_rows
+    }
+    eligibility.report("wait estimate")
+    ruled_out = set()
 
     def _count(by_node, partition, gpu_type):
         return sum(
@@ -1551,10 +1672,12 @@ def parse_wait_estimate_to_table(job):
         if score is None:
             print(f"Warning: no partition factor for {partition}, ranking against 0")
             score = 0
-        queue = _competing_jobs(
+        queue, kept_out = _competing_jobs(
             pending_rows, priorities, sharing, score, gpu_type, node_gpus,
             limits.get(partition, {}).get("max_minutes") or default_limit,
+            nodes, eligible_by_job,
         )
+        ruled_out |= kept_out
         our_nodes = -(-spec["gpus"] // node_gpus)
         ours = {
             "id": "ours",
@@ -1566,6 +1689,7 @@ def parse_wait_estimate_to_table(job):
             "minutes": spec["minutes"],
             "array": None,
             "throttle": None,
+            "eligible_nodes": nodes.keys(),
         }
         worst = _plan_pool(nodes, running, queue, ours, now)
         usage = efficiency.get(partition)
@@ -1584,6 +1708,9 @@ def parse_wait_estimate_to_table(job):
             }
         )
 
+    if ruled_out:
+        print(f"Note: the wait replay kept {len(ruled_out)} outranking pending jobs out of "
+              "at least one pool their -w, -x or --constraint rules out")
     far = datetime.max
     rows.sort(key=lambda r: (r["typical"] or r["worst"] or far, r["worst"] or far))
 
@@ -1605,7 +1732,7 @@ def parse_wait_estimate_to_table(job):
             walltime = f"{hours}h" if not minutes else f"{hours}h{minutes}m"
             shape = (
                 f"{spec['gpus']} gpu / {spec['cpus']} cpu / "
-                f"{spec['mem_mb'] // 1000}G / {walltime}"
+                f"{spec['mem_mb'] / 1024:.1f} GiB / {walltime}"
             )
             if spec["capped"]:
                 shape += (
@@ -1619,9 +1746,9 @@ def parse_wait_estimate_to_table(job):
             if usage:
                 typical_cell = _wait_cell(
                     row["typical"],
-                    f"Every job assumed to use {usage['ratio']:.0%} of its limit, what "
-                    f"{usage['jobs']} finished jobs in {partition} averaged over the last "
-                    f"{WALLTIME_SAMPLE_DAYS} days",
+                    f"Every job assumed to use {usage['ratio']:.0%} of its limit: the "
+                    f"{usage['jobs']} GPU jobs that finished in {partition} over the last "
+                    f"{WALLTIME_SAMPLE_DAYS} days ran that share of their time limits added up",
                 )
                 start = row["typical"]
             else:
@@ -1654,31 +1781,37 @@ def parse_wait_estimate_to_table(job):
         'and the GPUs they want. Jobs held by a dependency or a user limit are not '
         'counted">Ahead of You</th>'
         '<th title="Replay of the queue with every job running to its full time limit">'
-        "Worst Case</th>"
+        "Full Limits</th>"
         '<th title="Same replay with every job cut to the fraction of its limit jobs in '
-        'this partition actually use">Typical</th>'
-        '<th title="Start time behind the Typical column (Worst Case where Typical is '
-        'unavailable)">Start</th></tr>'
+        'this partition actually use">Historical Runtime</th>'
+        '<th title="Model start from Historical Runtime, or Full Limits when no sample '
+        'is available. This is not a Slurm forecast.">Model Start</th></tr>'
     )
 
     gpu_rows, mig_rows = _split_mig(rows, lambda row: row["spec"]["gpu_type"])
+    owner_entry = profile[0]
+    if owner_entry["member"]:
+        whose = (f"a new job by <b>{owner_entry['user']}</b> under <b>{job['account']}</b>, "
+                 "using your own fair-share")
+    else:
+        whose = (f"a new job under <b>{job['account']}</b>, using the median fair-share of "
+                 f"its members, since <b>{owner_entry['user']}</b> has no association there,")
 
     table_html = (
         f"<table>{header}{_render_rows(gpu_rows)}</table>"
-        '<p class="queue-note">Each row replays the scheduler for one pool: the jobs '
-        f"<code>sprio</code> ranks above a fresh submission from <b>{job['account']}</b> "
-        "are placed first, in priority order with backfill, as the running jobs free "
-        "their GPUs, and the wait is when your job lands. Jobs held by a dependency, an "
-        "invalid account or a per-user limit are left out, which is what "
-        "<code>sbatch --test-only</code> gets wrong &mdash; it charges you for all of "
-        "them and reports weeks in pools that clear in days. <b>Worst Case</b> lets every "
-        "job run to its time limit, the promise SLURM makes. <b>Typical</b> cuts every job "
-        "to the fraction of its limit that jobs in that partition actually used over the "
-        f"last {WALLTIME_SAMPLE_DAYS} days (hover for the ratio and sample), which on this "
-        "cluster is the number to plan around. Neither can know about jobs submitted after "
-        "this page loaded, nor about per-user QOS caps. A <b>*</b> next to a job shape "
-        "means the partition's own limits cut the request down; hover it for the "
-        "reason.</p>"
+        f'<p class="queue-note">These are per-pool model estimates for {whose} '
+        "and zero waiting age. They are not Slurm start forecasts or guaranteed bounds. "
+        "<b>Full Limits</b> uses requested walltimes; <b>Historical Runtime</b> scales "
+        "other jobs by the share of their time limits, added up, that the partition's GPU "
+        f"jobs used over the last {WALLTIME_SAMPLE_DAYS} days, failed and cancelled ones "
+        "included, so long jobs weigh more than short ones. Each row assumes all eligible higher-priority "
+        "work uses this pool; flexible jobs may actually start elsewhere, so a small pool "
+        "can show a much longer wait than the job experiences. "
+        "Future arrivals, reservations, changing priorities and user or array limits "
+        "can change the result. Jobs currently blocked by dependencies or user limits "
+        "are omitted. The Waiting Queue shows Slurm's own estimates for submitted jobs. "
+        "Free Now counts unallocated GPUs; CPU, memory and the requested duration must "
+        "also fit. A <b>*</b> means the partition limits reduced the requested shape.</p>"
     )
     if mig_rows:
         table_html += _folded("MIG slices", header + _render_rows(mig_rows))
@@ -1755,15 +1888,45 @@ def _qos_priorities():
     return priorities
 
 
-def _account_priority_profile(account):
-    """Fairshare factor and highest-priority QOS available to ``account``.
+def _submission_qos(default, allowed, who, qos_priorities):
+    """The QoS a job of association ``who`` gets without --qos, or None (warned)
+    when that cannot be told."""
+    names = []
+    for name in (q for q in allowed.split(",") if q):
+        if name in qos_priorities:
+            names.append(name)
+        else:
+            print(f"Warning: QOS {name!r} of {who} has no configured priority, skipping")
+    if default:
+        if default in names:
+            return default
+        print(f"Warning: default QOS {default!r} of {who} is not among its usable "
+              f"QOS ({', '.join(names) or 'none'})")
+        return None
+    if len(names) == 1:
+        return names[0]
+    if "normal" in names:
+        # Several QoS and no default. From memory of slurmctld, not checked here
+        # (every association seen on 2026-10-19 allowed one): a job without --qos
+        # then gets the root association's default, unset on Rivanna, or normal.
+        print(f"Warning: {who} allows {', '.join(names)} with no default QOS, assuming normal")
+        return "normal"
+    return None
 
-    Returns ``(entry, max_qos)``. ``entry`` holds the median FairShare of the
-    account's users and its best QOS with that QOS's priority, or is None (with a
-    warning) when SLURM gives no FairShare or no usable QOS; ``max_qos`` is the
-    highest QOS priority configured on the cluster.
+
+def _account_priority_profile(account):
+    """The monitor owner's fair-share and submission QoS under ``account``.
+
+    Returns ``(entry, max_qos)``. ``entry`` holds the owner's FairShare and the QoS a
+    job of theirs gets without --qos, with that QoS's priority, or is None (with a
+    warning) when SLURM gives no FairShare or no usable QoS; ``max_qos`` is the
+    highest QoS priority configured on the cluster. When the owner has no
+    association under ``account`` (``entry["member"]`` False), the median FairShare
+    of its members and the account's own QoS stand in, so the panels still show
+    where a typical member's job would land.
     """
-    shares = []
+    owner = _app_owner()
+    shares = {}
     for row in parse_cmd(f"sshare -a -n -P -A {account} -o Account,User,FairShare"):
         fields = row.split("|")
         if len(fields) < 3:
@@ -1773,60 +1936,82 @@ def _account_priority_profile(account):
         # The account-level row carries no FairShare of its own; only users do.
         if not user:
             continue
-        if not share:
+        if row_account != account:
+            print(f"Warning: sshare -A {account} returned a row for {row_account}/{user}, skipping")
+            continue
+        if not re.fullmatch(r"\d+(?:\.\d+)?", share):
             print(f"Warning: no FairShare for {row_account}/{user}, skipping")
             continue
-        try:
-            value = float(share)
-        except ValueError:
-            print(f"Warning: unparsable FairShare {share!r} for {row_account}/{user}, skipping")
-            continue
-        if row_account == account:
-            shares.append(value)
+        shares[user] = float(share)
+
+    member = owner in shares
+    fairshare = None
+    if member:
+        fairshare = shares[owner]
+    elif shares:
+        ranked = sorted(shares.values())
+        fairshare = ranked[len(ranked) // 2]
+        print(f"Warning: {owner} has no FairShare under {account}, using the median of its "
+              f"{len(ranked)} members")
 
     qos_priorities = _qos_priorities()
-    best = None
-    for row in parse_cmd(f"sacctmgr -n -P show assoc account={account} format=Account,QOS"):
+    assocs = {}  # user ("" for the account itself) -> (DefaultQOS, allowed QoS)
+    for row in parse_cmd(
+        f"sacctmgr -n -P show assoc account={account} format=Account,User,DefaultQOS,QOS"
+    ):
         fields = row.split("|")
-        if len(fields) < 2:
+        if len(fields) < 4:
             print(f"Warning: unexpected sacctmgr assoc row {row!r}, skipping")
             continue
-        row_account = fields[0].strip()
-        for name in (q.strip() for q in fields[1].split(",") if q.strip()):
-            if name not in qos_priorities:
-                print(f"Warning: QOS {name!r} of {row_account} has no configured priority, skipping")
-                continue
-            # A job may pick any QOS it is entitled to, so the best one is the
-            # one worth reporting.
-            if row_account == account and (best is None or qos_priorities[name] > qos_priorities[best]):
-                best = name
+        row_account, user, default, allowed = (f.strip() for f in fields[:4])
+        if row_account != account:
+            print(f"Warning: sacctmgr account={account} returned a row for "
+                  f"{row_account}/{user}, skipping")
+            continue
+        assocs[user] = (default, allowed)
+    # A non-member gets the account's own settings, which its members inherit
+    # unless their association overrides them.
+    key, who = (owner, f"{account}/{owner}") if member else ("", account)
+    if key in assocs:
+        qos = _submission_qos(*assocs[key], who, qos_priorities)
+    else:
+        print(f"Warning: sacctmgr has no association for {who}")
+        qos = None
 
     max_qos = max(qos_priorities.values()) if qos_priorities else 0
-    if not shares:
-        print(f"Warning: no user of {account} has a FairShare value, skipping the account")
+    if fairshare is None:
+        print(f"Warning: no user of {account} has a FairShare value")
         return None, max_qos
-    if best is None:
-        print(f"Warning: no usable QOS found for {account}, skipping the account")
+    if qos is None:
+        print(f"Warning: no unambiguous submission QOS for {who}")
         return None, max_qos
-    shares.sort()
-    entry = {"fairshare": shares[len(shares) // 2], "qos": best, "qos_priority": qos_priorities[best]}
+    entry = {"user": owner, "member": member, "fairshare": fairshare, "qos": qos,
+             "qos_priority": qos_priorities[qos]}
     return entry, max_qos
 
 
 def _partition_priority_data():
     """Per partition: the priorities of the jobs competing there, and its factor.
 
-    Jobs blocked by a dependency get no priority from SLURM and so never appear
-    here, which is what we want: the ranking is against the jobs actually racing
-    us for a node right now.
+    Only GPU jobs of the monitored partitions waiting for resources or priority
+    count, each array task once: jobs held back by a dependency or a limit are
+    not racing us for a node right now.
     """
     totals = defaultdict(list)
     factors = {}
+    pending = {row["jobid"]: row for row in squeue_jobs("PENDING", MONITORED_PARTITIONS)
+               if _classify_pending_reason(row["reason"]) == "waiting"
+               and alloc_gpu_count(row["tres-alloc"])}
+    # Routine skips, tallied and reported once below.
+    not_competing = 0
     for jobid, partition, total, factor in _sprio_rows():
         if not total.isdigit() or not factor.isdigit():
             print(f"Warning: unparsable sprio numbers {total!r}/{factor!r} for job {jobid}, skipping")
             continue
-        totals[partition].append(int(total))
+        if jobid not in pending:
+            not_competing += 1
+            continue
+        totals[partition].extend([int(total)] * _array_task_count(pending[jobid]["arraytaskid"]))
         if partition in factors and factors[partition] != int(factor):
             print(
                 f"Warning: partition {partition} reports two priority factors "
@@ -1834,6 +2019,9 @@ def _partition_priority_data():
             )
         else:
             factors[partition] = int(factor)
+    if not_competing:
+        print(f"Note: priority ranks left out {not_competing} sprio rows of jobs that are held "
+              "back, ask for no GPU or are queued outside the monitored partitions")
     for partition in totals:
         totals[partition].sort()
     return totals, factors
@@ -1853,12 +2041,24 @@ def parse_priority_to_table(account):
         return "<p>No GPU partition currently has jobs competing for priority.</p>"
     # A job submitted right now has no age factor yet.
     scores = _account_score(profile, {p: factors.get(p, 0) for p in partitions})
+    if entry["member"]:
+        whose = f"{entry['user']} / {account}"
+        fairshare_text = (
+            f"Fair-share is specific to <b>{entry['user']}</b> under <b>{account}</b>; "
+            "members of the same account can have different priorities."
+        )
+    else:
+        whose = f"{account} median"
+        fairshare_text = (
+            f"<b>{entry['user']}</b> has no association under <b>{account}</b>, so this "
+            "uses the median fair-share of its members, who can each have a different one."
+        )
 
     header = (
         '<tr><th>Partition</th><th title="Pending jobs SLURM is currently ranking in '
         'this partition; jobs blocked by a dependency get no priority and are not '
-        f'counted">Competing</th><th>{account}<br><span class="queue-muted">'
-        f'{entry["qos"]} / fs {entry["fairshare"]:.3f}</span></th></tr>'
+        f'counted">Competing Tasks</th><th>{whose}<br><span class="queue-muted">'
+        f'{entry["qos"]} / fs {entry["fairshare"]:.6f}</span></th></tr>'
     )
 
     body = ""
@@ -1887,10 +2087,11 @@ def parse_priority_to_table(account):
         "jobs already queued <b>in that partition</b> &mdash; higher is better. Ranking "
         "against the whole cluster would be misleading, because the partition factor "
         "shown next to each pool is added to every job there alike and cancels out. "
-        "Priority = QOS + fairshare + partition factor; age is worth at most "
-        f"{_priority_weights()['PriorityWeightAge']:,} even after weeks, so a new job is not "
-        "meaningfully behind an old one. Fairshare is the median across each account's "
-        "users and moves as the lab uses the cluster.</p>"
+        f"{fairshare_text} The new job has zero waiting age and Nice=0. Existing jobs retain their age bonus, which can "
+        "decide the order even within one lab. Counts include every pending array task "
+        "currently waiting for resources or priority; dependency and limit blocks are "
+        "excluded. This percentile compares priority scores, not resource fit or a "
+        "guaranteed place in Slurm's schedule.</p>"
     )
     return f"<table>{header}{body}</table>{note}"
 
@@ -1901,17 +2102,27 @@ def _short_stamp(stamp):
 
 
 def _short_limit(text):
-    """3-00:00:00 -> 3d, 1-12:00:00 -> 1d12h, 12:00:00 -> 12h.
+    """3-00:00:00 -> 3d, 1-12:00:00 -> 1d12h, 01:30:00 -> 1h30m.
 
-    Rounded up to the hour, so a limit is never shown shorter than it really is.
+    Keep minutes: a 90-minute allocation must not be shown as two hours.
     """
     minutes = _slurm_time_to_minutes(text)
     if minutes is None:
         return text
-    days, hours = divmod(-(-minutes // 60), 24)
-    if not days:
-        return f"{hours}h"
-    return f"{days}d{hours}h" if hours else f"{days}d"
+    days, remainder = divmod(minutes, 24 * 60)
+    parts = ((days, "d"), *zip(divmod(remainder, 60), "hm"))
+    return "".join(f"{value}{unit}" for value, unit in parts if value) or "0m"
+
+
+def _display_job_id(job):
+    """Use Slurm's array parent and task index rather than its internal row ID."""
+    tasks = job["arraytaskid"]
+    if tasks in UNSET_JOB_FIELD:
+        return job["jobid"]
+    suffix = _short_tasks(tasks)
+    if not tasks.isdigit():
+        suffix = f"[{suffix}]"
+    return f"{job['arrayjobid']}_{suffix}"
 
 
 def parse_queue_to_table(account):
@@ -1928,7 +2139,7 @@ def parse_queue_to_table(account):
     with a long list cut short (see :func:`_short_tasks`). The last line totals the account's pending jobs and the GPUs they ask for,
     counting each task of such a row.
     """
-    columns = ("jobid", "arraytaskid", "partition", "username", "timelimit",
+    columns = ("arraytaskid", "partition", "username", "timelimit",
                "tres-alloc", "submittime", "starttime", "reason")
     jobs = squeue_jobs("PENDING", account=account)
     if not jobs:
@@ -1936,25 +2147,25 @@ def parse_queue_to_table(account):
 
     shown = []
     total_jobs = total_gpus = 0
-    for jobid, tasks, partition, user, limit, tres, submit, start, reason in (
-        [job[c] for c in columns] for job in jobs
-    ):
+    for job in jobs:
+        tasks, partition, user, limit, tres, submit, start, reason = [job[c] for c in columns]
         count = _array_task_count(tasks)
-        if count > 1:
-            jobid = f"{jobid}_[{_short_tasks(tasks)}]"
+        jobid = _display_job_id(job)
         gpus = alloc_gpu_count(tres)
         total_jobs += count
         total_gpus += count * gpus
-        shown.append((jobid, partition, user, limit, gpus, submit, start, reason))
+        shown.append((jobid, partition, user, _short_limit(limit), gpus, submit, start, reason))
 
     id_width = max(10, *(len(job[0]) for job in shown))
-    line = "{:>" + str(id_width) + "} {:>14} {:>8} {:>6} {:>5} {:>11} {:>11}  {}"
+    limit_width = max(len("LIMIT"), *(len(job[3]) for job in shown))
+    line = ("{:>" + str(id_width) + "} {:>14} {:>8} {:>" + str(limit_width)
+            + "} {:>5} {:>11} {:>11}  {}")
     out = [line.format("JOBID", "PARTITION", "USER", "LIMIT", "GPUS",
                        "SUBMIT_TIME", "START_TIME", "NODELIST(REASON)")]
     for jobid, partition, user, limit, gpus, submit, start, reason in shown:
         # A job queued on several partitions lists all of them; cut it to the
         # column like squeue itself would rather than stretching every row.
-        out.append(line.format(jobid, partition[:14], user, _short_limit(limit), gpus,
+        out.append(line.format(jobid, partition[:14], user, limit, gpus,
                                _short_stamp(submit), _short_stamp(start), reason))
     out.append(f"\n{total_jobs} pending jobs, {total_gpus} GPUs")
     return "\n".join(out)
@@ -1994,7 +2205,7 @@ def parse_running_to_table(account):
     TRES, and GPU_TYPE the type of the nodes it runs on (see
     :func:`_gpu_type_on_nodes`). The last line totals the account's jobs and GPUs.
     """
-    columns = ("jobid", "partition", "username", "timeused", "timelimit",
+    columns = ("partition", "username", "timeused", "timelimit",
                "tres-alloc", "starttime", "nodelist")
     jobs = squeue_jobs("RUNNING", account=account)
     if not jobs:
@@ -2002,25 +2213,28 @@ def parse_running_to_table(account):
 
     inventory = parse_all_gpus()
     shown = []
-    for jobid, partition, user, used, limit, tres, start, nodes in (
-        [job[c] for c in columns] for job in jobs
-    ):
+    for job in jobs:
+        partition, user, used, limit, tres, start, nodes = [job[c] for c in columns]
+        jobid = _display_job_id(job)
         gpus = alloc_gpu_count(tres)
         gpu_type = _gpu_type_on_nodes(jobid, nodes, inventory) if gpus else "-"
-        shown.append((jobid, partition, user, used, limit, gpus, gpu_type, start, nodes))
+        shown.append((jobid, partition, user, used, _short_limit(limit), gpus, gpu_type,
+                      start, nodes))
 
     # A running job sits in one partition, so the column is as wide as the
     # longest name rather than cut short like the waiting queue's.
     part_width = max(len("PARTITION"), *(len(job[1]) for job in shown))
     type_width = max(len("GPU_TYPE"), *(len(job[6]) for job in shown))
-    line = ("{:>10} {:>" + str(part_width) + "} {:>8} {:>11} {:>6} {:>5} {:>"
-            + str(type_width) + "} {:>11}  {}")
+    id_width = max(len("JOBID"), *(len(job[0]) for job in shown))
+    limit_width = max(len("LIMIT"), *(len(job[4]) for job in shown))
+    line = ("{:>" + str(id_width) + "} {:>" + str(part_width) + "} {:>8} {:>11} {:>"
+            + str(limit_width) + "} {:>5} {:>" + str(type_width) + "} {:>11}  {}")
     out = [line.format("JOBID", "PARTITION", "USER", "TIME", "LIMIT", "GPUS",
                        "GPU_TYPE", "START_TIME", "NODELIST")]
     total_gpus = 0
     for jobid, partition, user, used, limit, gpus, gpu_type, start, nodes in shown:
         total_gpus += gpus
-        out.append(line.format(jobid, partition, user, used, _short_limit(limit),
+        out.append(line.format(jobid, partition, user, used, limit,
                                gpus, gpu_type, _short_stamp(start), nodes))
     out.append(f"\n{len(jobs)} running jobs, {total_gpus} GPUs")
     return "\n".join(out)

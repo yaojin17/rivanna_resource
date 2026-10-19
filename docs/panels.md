@@ -33,6 +33,8 @@ GPU, CPU and memory of every node, grouped by GPU type, with a state badge (`idl
 its GPUs count as offline even when they look free. `comp` means a job on the node is
 still cleaning up; SLURM starts nothing there until it is done, which usually takes
 seconds but can take hours, so the node counts as offline meanwhile.
+Available GPU counts describe unallocated cards. A job must also fit the remaining
+CPU and memory on the same node and the available scheduling window.
 
 ![Resource available](../screenshots/resource.png)
 
@@ -71,31 +73,52 @@ Per GPU type: GPUs free, jobs waiting, GPUs they want, and queue depth.
 
 - Only jobs queued for the monitored GPU partitions count; a job also listing other
   partitions is counted for its monitored ones.
-- A job that fits several GPU types is counted under each, so `Flexible` overlaps.
+- A job that fits several GPU types is counted under each, so `Flexible` and the
+  flexible part of `Not Competing` overlap between rows. Only the summary is unique.
+- Candidate types respect Features and requested (`-w`) or excluded (`-x`) nodes.
+  Constraints are read when they join features with `&` and `|`, brackets included;
+  one using counts, parentheses or negation leaves its job free to use any node, and
+  the log names it. A job whose constraint or node lists rule out every node it could
+  use counts as `Not Competing`.
 - Jobs blocked by a dependency or a QOS/array limit are shown as `Not Competing`.
 
 ## Estimated Wait for a Standard Job
 
-*Scope: account · Built from `squeue`, `sprio`, `sshare`, `sacct`, `sacctmgr`, `scontrol`,
+*Scope: you under the selected account · Built from `squeue`, `sprio`, `sshare`, `sacct`, `sacctmgr`, `scontrol`,
 `sinfo`, `sbatch --test-only`*
 
 "If I submit now, when do I start?" Enter GPUs, CPUs, memory and walltime; each row
-replays the scheduler for one GPU pool, placing every job ranked above yours first.
+models one GPU pool, placing higher-priority work first. Your own fair-share and
+submission QoS determine the new job's score, with zero waiting age; for an account you
+are not a member of, its members' median fair-share stands in. Memory is in GiB,
+matching `sbatch --mem=NG`.
 
 ![Estimated Wait](../screenshots/wait_estimate.png)
 
-- `Worst Case`: every job runs to its time limit.
-- `Typical`: every job runs for the fraction of its limit that jobs in that partition
-  really used over the last 3 days.
+- `Full Limits`: every job runs to its time limit.
+- `Historical Runtime`: other jobs run for the share of their time limits, added up,
+  that the partition's GPU jobs used over the last 3 days, failed and cancelled ones
+  included. Long jobs weigh more than short ones.
+- `Model Start`: the resulting estimate, not Slurm's start forecast or a guaranteed bound.
 - A running job with no time limit is assumed to keep what it holds for the whole
   30 days the replay looks ahead.
+- Feature constraints and requested/excluded nodes restrict placements. Each row assumes
+  all eligible higher-priority work uses that pool. Flexible jobs may run elsewhere, so
+  small pools can show much longer waits than a job experiences.
+  Future arrivals, reservations, priority changes and user or array
+  limits can change the result. Waiting Queue shows Slurm's forecasts for submitted jobs.
 
 ## Priority in Each Pool
 
-*Scope: account · Built from `sprio`, `sshare`, `sacctmgr`, `scontrol`, `sinfo`*
+*Scope: you under the selected account · Built from `sprio`, `sshare`, `sacctmgr`, `scontrol`, `sinfo`*
 
-Where a new job from your account would rank among the jobs queued in each partition.
+Where a new job by you would rank among competing GPU tasks in each partition.
 Ranks are per partition because the partition factor is added to every job in it alike.
+Every pending array task counts. Jobs blocked by dependencies or limits do not.
+Members of the same account can have different fair-share values. For an account you
+are not a member of, its members' median fair-share stands in. Existing jobs keep
+their waiting-age bonus, which can decide their order. A percentile compares scores;
+it does not establish resource fit or guarantee a position in the scheduler's plan.
 
 ![Priority](../screenshots/priority.png)
 
@@ -106,6 +129,8 @@ Ranks are per partition because the partition factor is added to every job in it
 Your account's running jobs with `squeue`'s own columns: how long each has run, its
 time limit, the GPUs it holds (`0` for CPU-only jobs), when it started and on which
 nodes. The last line totals the account's running jobs and GPUs.
+Array jobs show their parent ID and task index. Limits keep minutes, so a 90-minute
+allocation reads `1h30m`.
 
 `GPU_TYPE` is the GPU type of the node the job landed on (`-` for CPU-only jobs). A job
 sent to a mixed partition such as `gpu` without naming a type shows only `gpu` under
@@ -124,3 +149,5 @@ SLURM's own estimate and reads N/A for jobs it has not planned, such as held one
 An array's tasks that have not started share one row, whose `JOBID` shows their range
 as `squeue` does (`20478034_[155-742%4]`). The last line totals the account's pending
 jobs and the GPUs they request, counting every task of such a row.
+Individual array tasks also show the parent and index, even after Slurm gives each an
+internal record ID. Time limits retain minutes.
