@@ -63,6 +63,8 @@ python available_resources.py    # only what is free
 
 ## What's new
 
+- **2026-10-21** Running Jobs tells 40 GB and 80 GB A100s apart (`a100_40gb`,
+  `a100_80gb`).
 - **2026-10-19** Priority and wait estimates use the monitor owner's fair-share
   and submission QoS under the selected account, or its members' median for an
   account the owner is not in. Priority counts every array task.

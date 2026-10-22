@@ -69,6 +69,8 @@ GPU_TYPES = {
     "h200": (8.9, "[141g]"),
     "a4500": (8.0, "[20g]"),
     "a100": (8.0, "[40/80g]"),
+    "a100_80gb": (8.0, "[80g]"),
+    "a100_40gb": (8.0, "[40g]"),
     "a6000": (8.6, "[48g]"),
     "a40": (8.6, "[48g]"),
     "a30": (8.0, "[24g]"),
@@ -2171,15 +2173,28 @@ def parse_queue_to_table(account):
     return "\n".join(out)
 
 
-def _gpu_type_on_nodes(jobid, node_str, inventory):
+def _sized_type(gpu_type, node, features):
+    """``a100`` on a node with feature ``a100_80gb`` -> ``a100_80gb``.
+
+    Rivanna's 40 GB and 80 GB A100s share one GRES type; only the node feature
+    tells them apart. Other types carry no such feature and stay as they are.
+    """
+    sized = [f for f in features if re.fullmatch(rf"{re.escape(gpu_type)}_\d+gb", f)]
+    if len(sized) > 1:
+        print(f"Warning: {node} has features {sized} for {gpu_type}; showing plain {gpu_type}")
+    return sized[0] if len(sized) == 1 else gpu_type
+
+
+def _gpu_type_on_nodes(jobid, node_str, inventory, records):
     """GPU type a running job holds, read off the nodes it runs on.
 
     A job sent to a mixed partition such as ``gpu`` without naming a type has no
     type anywhere in squeue; only the node it landed on tells. ``inventory`` is
-    :func:`parse_all_gpus` output. Returns ``?`` when the node list is missing or
-    a node is missing from the inventory, and every type joined with ``/`` when
-    the nodes offer more than one, since the job's own share cannot be told
-    apart then.
+    :func:`parse_all_gpus` output and ``records`` :func:`node_records` output,
+    whose features give an A100's memory (see :func:`_sized_type`). Returns ``?``
+    when the node list is missing or a node is missing from the inventory, and
+    every type joined with ``/`` when the nodes offer more than one, since the
+    job's own share cannot be told apart then.
     """
     nodes = parse_node_names(node_str) if node_str else []
     if not nodes:
@@ -2190,7 +2205,11 @@ def _gpu_type_on_nodes(jobid, node_str, inventory):
         if node not in inventory:
             print(f"Warning: GPU job {jobid} runs on {node}, which lists no GPUs; type shown as ?")
             return "?"
-        types.update(entry["type"] for entry in inventory[node])
+        if node not in records:
+            print(f"Warning: no scontrol record for {node} of GPU job {jobid}; "
+                  "its type is shown without memory size")
+        features = records.get(node, {}).get("ActiveFeatures", "").split(",")
+        types.update(_sized_type(entry["type"], node, features) for entry in inventory[node])
     if len(types) > 1:
         print(f"Warning: nodes {node_str} of job {jobid} offer several GPU types "
               f"{sorted(types)}; showing them all")
@@ -2212,12 +2231,13 @@ def parse_running_to_table(account):
         return f"no running job in {account}"
 
     inventory = parse_all_gpus()
+    records = node_records()
     shown = []
     for job in jobs:
         partition, user, used, limit, tres, start, nodes = [job[c] for c in columns]
         jobid = _display_job_id(job)
         gpus = alloc_gpu_count(tres)
-        gpu_type = _gpu_type_on_nodes(jobid, nodes, inventory) if gpus else "-"
+        gpu_type = _gpu_type_on_nodes(jobid, nodes, inventory, records) if gpus else "-"
         shown.append((jobid, partition, user, used, _short_limit(limit), gpus, gpu_type,
                       start, nodes))
 
