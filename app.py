@@ -69,8 +69,8 @@ GPU_TYPES = {
     "h200": (8.9, "[141g]"),
     "a4500": (8.0, "[20g]"),
     "a100": (8.0, "[40/80g]"),
-    "a100_80gb": (8.0, "[80g]"),
-    "a100_40gb": (8.0, "[40g]"),
+    "a100-80": (8.0, "[80g]"),
+    "a100-40": (8.0, "[40g]"),
     "a6000": (8.6, "[48g]"),
     "a40": (8.6, "[48g]"),
     "a30": (8.0, "[24g]"),
@@ -2174,15 +2174,18 @@ def parse_queue_to_table(account):
 
 
 def _sized_type(gpu_type, node, features):
-    """``a100`` on a node with feature ``a100_80gb`` -> ``a100_80gb``.
+    """``a100`` on a node with feature ``a100_80gb`` -> ``a100-80``.
 
     Rivanna's 40 GB and 80 GB A100s share one GRES type; only the node feature
-    tells them apart. Other types carry no such feature and stay as they are.
+    tells them apart. The short form follows the partition names (gpu-a100-80).
+    Other types carry no such feature and stay as they are.
     """
-    sized = [f for f in features if re.fullmatch(rf"{re.escape(gpu_type)}_\d+gb", f)]
-    if len(sized) > 1:
-        print(f"Warning: {node} has features {sized} for {gpu_type}; showing plain {gpu_type}")
-    return sized[0] if len(sized) == 1 else gpu_type
+    sizes = [match.group(1) for f in features
+             if (match := re.fullmatch(rf"{re.escape(gpu_type)}_(\d+)gb", f))]
+    if len(sizes) > 1:
+        print(f"Warning: {node} has several memory features for {gpu_type} "
+              f"({', '.join(sizes)} GB); showing plain {gpu_type}")
+    return f"{gpu_type}-{sizes[0]}" if len(sizes) == 1 else gpu_type
 
 
 def _gpu_type_on_nodes(jobid, node_str, inventory, records):

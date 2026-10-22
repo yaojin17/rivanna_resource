@@ -135,7 +135,7 @@ allocation reads `1h30m`.
 `GPU_TYPE` is the GPU type of the node the job landed on (`-` for CPU-only jobs). A job
 sent to a mixed partition such as `gpu` without naming a type shows only `gpu` under
 `PARTITION`; this column tells you whether it got, say, an A100 or an RTX PRO 6000.
-A100s show their memory, `a100_40gb` or `a100_80gb`, read from the node's feature.
+A100s show their memory in GB, `a100-40` or `a100-80`, read from the node's feature.
 `a40/a100` means the job's nodes offer more than one type, so which one it holds cannot
 be told from the nodes. `?` means the type could not be looked up: the node list is
 missing or was cut off by `squeue`, or a node lists no GPUs.
